@@ -1,3 +1,4 @@
+#include "dm_power_profile.h"
 #include <math.h>
 // iOS 前端（front.h 的 iOS 实现）。App 在主线程建好 Metal 视图（front_ios_view），再在大栈线程上调 dm_main；
 // front_run在该线程跑客体；真实触点保留dm_touch_set通路，独立控制器输出完整手柄状态。
@@ -610,7 +611,7 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
             // 系统取消触摸（通知横幅、系统手势）不当松手：拖着的物品放回原处、货架 / 成叠格拖出不买不取，别的手指只放掉按着的东西，不补脉冲、不点世界、不点界面
             // A system-cancelled touch (notification banner, system gesture) is not treated as a release: the dragged item is put back, a drag out of the shelf / stacked cell neither buys nor withdraws, and other fingers only release what they hold, with no make-up pulse, no world tap and no UI tap
             if(!strcmp(phase,"cancelled")) { dm_tc_finger *cf=&_controls.finger[i]; BOOL drag=_controls.navigation_mode && _controls.pointer_slot==i && (cf->pointer_dragged || cf->shop_drag);
-                if(_uiDragOn && _controls.pointer_slot==i) { _uiDragOn=NO; dm_ui_drag_end(); }
+            if(_uiDragOn && _controls.pointer_slot==i) { _uiDragOn=NO; dm_ui_drag_end(); }
                 if(drag) { BOOL shop=cf->shop_drag; if(!shop) dm_tc_pointer_release(&_controls,0); dm_tc_end_at(&_controls,i,CACurrentMediaTime()); LOG("前端：拖动中被系统取消触摸 → %s",shop?"不买不取":"放回原处"); }
                 else { dm_tc_cancel_finger(&_controls,i); LOG("前端：系统取消触摸（槽 %d）→ 不当松手",i); }
                 if(_controls.pointer_slot<0) { _relAsked=NO; _itemAsked=NO; }
@@ -923,6 +924,10 @@ uint64_t front_game_res(int docked) {
         CGRect b = UIScreen.mainScreen.nativeBounds; aspect = fmax(b.size.width, b.size.height) / fmin(b.size.width, b.size.height);
         const char *e = getenv("DM_GAME_RES"); if (e && sscanf(e, "%ux%u", &fw, &fh) == 2) aspect = (double)fw / fh;
         else { fw = (unsigned)fmax(b.size.width, b.size.height); fh = (unsigned)fmin(b.size.width, b.size.height);
+#if defined(DM_LEGACY_IOS17)
+            uint64_t limited = dm_power_dimensions(fw,fh,dm_power_profile(getenv("DM_POWER_PROFILE")));
+            fw=(unsigned)limited;fh=(unsigned)(limited>>32);
+#endif
             // 比 16:9 窄的屏（iPad 4:3）：游戏界面按屏高缩放、按 ≥16:9 设计，4:3 下面板横向放不下。按屏宽取 16:9，画面居中、上下留黑边
             // 第二步（真全屏，缺省）：局内画面按屏幕原生比例出、3D 铺满，界面由宿主按 16:9 摆并贴底；前端各页与读取画面仍是 16:9 居中留边（dm_uiscreen）。
             // DM_IPAD_FULL=0 退回上面那种全程 16:9 加黑边
@@ -956,6 +961,33 @@ void front_run(void (*guest)(void)) {
 // 测试脚本驱动真输入对话框用（触点脚本的 type / alert 两个动作）：当前弹着的对话框与它的结束回调。产品路径不读这两个量。
 // Software keyboard input box (front.h): the main thread presents a UIAlertController + text field, and the guest thread blocks until OK / Cancel. With no window (non-boot mode) nothing is presented and -1 is returned
 // For test scripts driving the real input dialog (the type / alert actions of the touch script): the dialog currently shown and its completion callback. The product path does not read these two.
+void mtl_present_discard_reason(unsigned,int);
+void dm_gamepad_reset(void);
+static NSMutableSet<NSNumber *> *g_native_ui_leases;static uint64_t g_native_ui_seq;
+uint64_t front_ios_native_ui_begin(const char *kind) {
+    NSCAssert(NSThread.isMainThread,@"native UI gate must run on main");
+    if(!g_layer)return 0;
+    if(!g_native_ui_leases)g_native_ui_leases=[NSMutableSet set];
+    uint64_t token=++g_native_ui_seq;[g_native_ui_leases addObject:@(token)];
+    [g_touch_view cancelControls];dm_gamepad_reset();
+    mtl_present_discard_reason(1,1);
+    LOG("前端：系统UI呈现门 开 token=%llu kind=%s owners=%lu",(unsigned long long)token,kind,(unsigned long)g_native_ui_leases.count);
+    return token;
+}
+static void native_ui_release_when_hidden(uint64_t token,__weak UIViewController *modal) {
+    if(![g_native_ui_leases containsObject:@(token)])return;
+    // Action/completion callbacks may precede dismissal animation. Do not expose new Metal frames until the modal is detached.
+    if(modal && (modal.viewIfLoaded.window || modal.isBeingDismissed)) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,16000000),dispatch_get_main_queue(),^{native_ui_release_when_hidden(token,modal);});return;
+    }
+    [g_native_ui_leases removeObject:@(token)];
+    if(!g_native_ui_leases.count)mtl_present_discard_reason(1,0);
+    LOG("前端：系统UI呈现门 关 token=%llu owners=%lu",(unsigned long long)token,(unsigned long)g_native_ui_leases.count);
+}
+void front_ios_native_ui_end(uint64_t token,UIViewController *modal) {
+    if(!token)return;__weak UIViewController *weakModal=modal;
+    dispatch_async(dispatch_get_main_queue(),^{native_ui_release_when_hidden(token,weakModal);});
+}
 static UIAlertController *g_text_alert; static void (^g_text_alert_finish)(int);
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
     if (!g_layer) return -1;
@@ -1024,7 +1056,8 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
                 tf.text = [tf.text substringWithRange:keep];
             }] forControlEvents:UIControlEventEditingChanged];
         }];
-        void (^finish)(int) = ^(int ok) { UIAlertController *sa = wa; g_text_alert = nil; g_text_alert_finish = nil; if (ok) text = sa.textFields.firstObject.text;   // 弱引用对话框：按钮回调 → finish → 对话框 → 按钮 是个环，对话框每弹一次留一个 | weak reference to the dialog: button callback -> finish -> dialog -> button is a cycle, leaving one dialog behind every time it is shown
+        __block uint64_t nativeToken=0;__block int finished=0;
+        void (^finish)(int) = ^(int ok) { if(finished)return;finished=1;front_ios_native_ui_end(nativeToken,wa); g_text_alert = nil; g_text_alert_finish = nil; if (ok) text = wa.textFields.firstObject.text;
             // 名字留空点确定 = 随机取名：我们自己抽一个（dm_namegen.c，约 1.8 万种、与已有角色重名就再抽），当作玩家输入的名字返回，走游戏原本的起名校验；只填进名字框不自动接受（同原版「随机名字」键，玩家看到再点创建）。
             // 原先发原版「随机名字」键，那是按职业在 12 个名字里依次轮，容易撞
             // Leaving the name empty and tapping OK = random naming: we draw one ourselves (dm_namegen.c, about 18,000 variants; redraw if it collides with an existing character), return it as the name the player typed, and go through the game's original name validation; it is only filled into the name field and not auto-accepted (same as the original game's 「随机名字」(Random Name) key: the player sees it and then taps create).
@@ -1051,6 +1084,7 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
         if (!vc) { vc = alt ?: any; LOG("前端：系统输入框——此刻没有主窗口，改用%s", alt ? "前台活跃场景的窗口" : any ? "任一窗口" : "（也没有）"); }
         while (vc.presentedViewController) vc = vc.presentedViewController;
         if (!vc) { LOG("前端：【红】系统输入框没找到可弹的界面，按取消返回（游戏那边的输入框保持原值）"); r = 0; dispatch_semaphore_signal(done); return; }
+        nativeToken=front_ios_native_ui_begin("keyboard");
         [vc presentViewController:a animated:YES completion:^{
             // 测试开关 DM_TEST_KBD_TYPE="文本" 或 ":cancel"：对话框照常弹出，1.5 秒后把文本经文本框的「内容已变」事件填进去（走与手打同一条限长路径）再点确定 / 取消。
             // 验的是真对话框这条路（弹出、限长、回写、取消）；验不了的只有人手在系统键盘上敲字本身
@@ -1141,11 +1175,10 @@ static void audio_apply(void) { dm_audio_suspend(g_audio_bg || g_audio_intr); }
 // During this time the game main loop runs as usual and presented frames are simply dropped. Outside a run (main menu / character select) do not wait: there is no unsaved progress there
 static void background_wait_save(void) {
     int dm_ingame_now(void); void mtl_present_discard(int on); int dm_save_wait(double max_s, uint64_t *commits, int *froze, double *ms);
+    mtl_present_discard(1); // iOS17: retain admission closure until foreground, including menus
     if (!dm_ingame_now()) return;
     uint64_t n = 0; int froze = 0; double ms = 0;
-    mtl_present_discard(1);
-    dm_save_wait(2.5, &n, &froze, &ms);   // 游戏停着（暂停菜单开着）时冻住世界、临时放开暂停存这一次，存完写回（diag.c） | If the game is stopped (pause menu open), freeze the world and temporarily release the pause for this one save, then write it back (diag.c)
-    mtl_present_discard(0);
+    dm_save_wait(2.5, &n, &froze, &ms); // official pause-aware save; do not reopen presentation in background
     LOG("前端：进后台等游戏存盘 %.0f ms，期间存档提交 %llu 次%s%s", ms, (unsigned long long)n, froze ? "（原先暂停着：冻结世界存盘、已恢复暂停）" : "", n ? "" : "【红】（2.5 秒内没等到）");
 }
 // 失活时也请游戏存一次盘（查 #22 发现的缺口）：上划进多任务界面时 App 多半只「失活」、不进后台，在那里直接划掉进程
@@ -1173,7 +1206,7 @@ void front_ios_focus_event(int ev) {
             background_wait_save();   // 进后台先让游戏存一次盘并等提交完成，再挂起：手机上切出去后进程随时可能被系统回收，原版 5 分钟才自动存一次 | On entering background, first have the game save once and wait for the commit to finish, then suspend: on a phone the process may be reclaimed by the system at any time after switching away, and the original game only auto-saves every 5 minutes
             guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); break;   // 挂起返回前在途 GPU 已清空 | In-flight GPU work is already drained before the suspend returns
         case 2: dm_ui_lifecycle(0); { void dm_update_foreground(void); dm_update_foreground(); void dm_cloud_foreground(void); dm_cloud_foreground(); }   // 回前台时人若停在选角页，重查一次新版本（dm/host/dm_update.c；局内不查） | If the player is on the character select page when returning to foreground, check for a new version once more (dm/host/dm_update.c; not checked in a run)
-            { void dm_3d_scale_resumed(void); dm_3d_scale_resumed(); } dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); g_audio_bg = g_audio_intr = 0; audio_apply(); dm_focus_set(2); break;   // 回前台一律当打断已过：进后台时系统自己会发一次「被打断」（真机实测），却不保证回来时补发「结束」；会话若真还被占，启动声卡失败不致命、激活时重试 | Returning to foreground always treats the interruption as over: when entering background the system itself sends one "interrupted" (measured on a real device) but does not guarantee an "ended" on return; if the session is really still occupied, failing to start the audio device is not fatal and is retried on activation
+            { void dm_3d_scale_resumed(void); dm_3d_scale_resumed(); } dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); { void mtl_present_discard(int); mtl_present_discard(0); } g_audio_bg = g_audio_intr = 0; audio_apply(); dm_focus_set(2); break;   // 回前台一律当打断已过：进后台时系统自己会发一次「被打断」（真机实测），却不保证回来时补发「结束」；会话若真还被占，启动声卡失败不致命、激活时重试 | Returning to foreground always treats the interruption as over: when entering background the system itself sends one "interrupted" (measured on a real device) but does not guarantee an "ended" on return; if the session is really still occupied, failing to start the audio device is not fatal and is retried on activation
         case 3: dm_focus_set(1); audio_apply(); break;   // 激活时再对一次音频：上次恢复没成（会话还被占）的在这里重试 | Reconcile audio once more on activation: a previous resume that failed (session still occupied) is retried here
     }
 }
@@ -1315,7 +1348,6 @@ static void touch_script_start(void) {
         while(next<steps.count && [steps[next][0] doubleValue]<=now) {
             NSArray *f=steps[next++]; NSString *op=f.count>1?f[1]:@""; aw_on=0;
             if([op isEqualToString:@"shot"]) window_shot(f[2]);
-            else if([op isEqualToString:@"burst"] && f.count>=4) { void dm_gfx_burst(int, const char *); dm_gfx_burst([f[2] intValue], [doc stringByAppendingPathComponent:f[3]].UTF8String); LOG("[script] burst %d 帧 → %s", [f[2] intValue], [f[3] UTF8String]); }
             else if([op isEqualToString:@"tshot"]) [g_touch_view captureTouchLayer:[doc stringByAppendingPathComponent:f[2]]];   // 操作层 PNG + 控件/当前技能元数据 JSON | Control layer PNG + JSON metadata of widgets / current skills
             // type <文字>：往弹着的输入对话框里敲字——走 UITextField 的 insertText:（系统键盘上屏走的同一个入口，照样触发输入规则的拦截）；
             // alert ok|cancel：点对话框的「确定」/「取消」。两者都只在对话框弹着时有效，没弹着就记一行日志
@@ -1377,7 +1409,13 @@ void front_ios_lifecycle_install(void) {
           g_dm_brightness = UIScreen.mainScreen.brightness; }]; }
     // 温控档位：启动记一次，之后每次变化记一行；宿主每 300 帧上屏行带出当前档位（M1 冷却判据：开测前连续 60 s 为 0）
     // Thermal state: logged once at launch, then one line on every change; the host's every-300-frames present line carries the current state (M1 cooling criterion: 0 for 60 s in a row before the test starts)
-    { g_dm_thermal = (int)NSProcessInfo.processInfo.thermalState; LOG("温控档位 %d（启动）", g_dm_thermal); LOG("持续执行档：%d（1 = 系统已按稳态功率限制本进程）", (int)[NSProcessInfo.processInfo hasPerformanceProfile:NSProcessPerformanceProfileSustained]);
+    { g_dm_thermal = (int)NSProcessInfo.processInfo.thermalState; LOG("温控档位 %d（启动）", g_dm_thermal); 
+#if defined(DM_LEGACY_IOS17)
+      LOG("持续执行档：iOS17兼容构建不查询新系统性能接口");
+#else
+      LOG("持续执行档：%d（1 = 系统已按稳态功率限制本进程）", (int)[NSProcessInfo.processInfo hasPerformanceProfile:NSProcessPerformanceProfileSustained]);
+#endif
+
       [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n;
           int t = (int)NSProcessInfo.processInfo.thermalState; if (t != g_dm_thermal) { LOG("温控档位 %d → %d", g_dm_thermal, t); g_dm_thermal = t; } }]; }
     // 浸泡（DM_SOAK，diag.c 每 N 秒写一行 TSV）：真机另每 60 秒记一行温控档位（0 正常 / 1 微热 / 2 严重 / 3 危急），看发热降频与帧时间的关系

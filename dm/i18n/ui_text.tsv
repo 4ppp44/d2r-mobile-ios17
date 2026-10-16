@@ -359,6 +359,8 @@ dmAppKeysText	用键盘时，界面上的按键提示显示的就是键盘上的
 dmAppShareLog	分享日志…	Share Logs…	帮助菜单：把两份日志与版本信息打成压缩包，玩家选位置存下（不上传）
 dmAppShareInfo	版本信息	Version Info	分享日志压缩包里版本信息那份文件的标题行
 dmAppShareFail	日志打包失败	Could Not Pack the Logs	分享日志失败时提示框的标题
+dmCustomLangEn	语言 / Language：English	Language: English	自定义页标题行右侧的语言开关（中文界面写中英两个词；英文界面的字体没有汉字，只写英文——English 这个词两种界面下都认得；勾上 = 英文界面 + 英文语音）
+dmCustomLangHint	重启游戏后生效 / Restart to apply	Restart to apply	语言开关勾选与当前语言不一致时显示在它下面
 dmTvChecking	正在检查游戏文件…	Checking game files…	Apple TV 版启动页（dm/tvos/main.m，下同）
 dmTvNoRomfs	游戏文件还不齐全：\n%s	The game files are incomplete:\n%s	游戏文件校验没过；%s = 校验给的原因
 dmTvNoAstcIndex	老机型补充包的覆盖层索引不在（romfs_overlay_astc/data/.build.config）	The Legacy Device Pack index is missing (romfs_overlay_astc/data/.build.config)	补充包到了、配套的覆盖层索引没拷进来

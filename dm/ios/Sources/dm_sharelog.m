@@ -92,6 +92,8 @@ static UIViewController *top_vc(void) {   // 同 front_ios.m 系统输入框找�
     vc = vc ?: alt ?: any; while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
+uint64_t front_ios_native_ui_begin(const char *);
+void front_ios_native_ui_end(uint64_t,UIViewController *);
 static _Atomic int g_busy;   // 打包 / 分享面板开着时再点不叠第二个 | Tapping again while packaging / the share sheet is open does not stack a second one
 static void on_click(void) {   // 宿主在游戏主线程调：玩家点了「分享诊断日志」 | Called by the host on the game main thread: the player tapped 「分享诊断日志」(Share Diagnostics)
     if (atomic_exchange(&g_busy, 1)) { plog("诊断日志：分享面板还开着，这次点击不再弹"); return; }
@@ -101,16 +103,18 @@ static void on_click(void) {   // 宿主在游戏主线程调：玩家点了「�
             UIViewController *vc = u ? top_vc() : nil;
             if (!vc) { if (u) plog("诊断日志：【红】没找到可弹分享面板的界面"); atomic_store(&g_busy, 0); return; }
             UIActivityViewController *a = [[UIActivityViewController alloc] initWithActivityItems:@[u] applicationActivities:nil];
+            uint64_t nativeToken=front_ios_native_ui_begin("share");
+            __weak UIActivityViewController *weakActivity=a;
             a.completionWithItemsHandler = ^(UIActivityType t, BOOL done, NSArray *items, NSError *e) { (void)items;
                 plog("诊断日志：分享面板收起（%s%s%s）", done ? "已发到 " : "没发", done ? (t ?: @"未知").UTF8String : "", e ? [NSString stringWithFormat:@"，错误 %@", e.localizedDescription].UTF8String : "");
-                atomic_store(&g_busy, 0); };
+                front_ios_native_ui_end(nativeToken,weakActivity);atomic_store(&g_busy, 0); };
             UIPopoverPresentationController *pp = a.popoverPresentationController;   // iPad / Mac 上是弹出框：锚在画面正中（暂停菜单所在处），不画箭头 | On iPad / Mac it is a popover: anchored at the center of the picture (where the pause menu is), no arrow drawn
             if (pp) { pp.sourceView = vc.view; pp.sourceRect = CGRectMake(CGRectGetMidX(vc.view.bounds), CGRectGetMidY(vc.view.bounds), 1, 1); pp.permittedArrowDirections = 0; }
             [vc presentViewController:a animated:YES completion:^{
                 plog("诊断日志：分享面板已弹出（%s，%s）", pp ? "弹出框" : "底部面板", NSStringFromCGRect(a.view.frame).UTF8String);
                 const char *tc = getenv("DM_TEST_SHARELOG_CLOSE"); if (!tc) return;
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(tc) * 1e9)), dispatch_get_main_queue(), ^{
-                    [a dismissViewControllerAnimated:NO completion:^{ plog("诊断日志：测试开关 DM_TEST_SHARELOG_CLOSE 到点收起分享面板"); atomic_store(&g_busy, 0); }]; });
+                    [a dismissViewControllerAnimated:NO completion:^{ plog("诊断日志：测试开关 DM_TEST_SHARELOG_CLOSE 到点收起分享面板"); front_ios_native_ui_end(nativeToken,a);atomic_store(&g_busy, 0); }]; });
             }];
         });
     });

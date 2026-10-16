@@ -81,3 +81,7 @@ int main(void) { @autoreleasepool {
     mtl_present_wait(tk);mtl_present_test_stall(0);
     printf("== %d 项，失败 %d ==\n",cases,failed);return failed!=0;
 } }
+
+// 无客体堆的图形夹具：报告未读到，不代表真机堆验证。
+// Graphics fixture without a guest heap: report unavailable, not device validation.
+int dm_guest_heap_stat(unsigned long long *t,unsigned long long *f,unsigned long long *m){*t=*f=*m=0;return 0;}

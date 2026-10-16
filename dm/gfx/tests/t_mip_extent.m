@@ -119,3 +119,7 @@ int main(int argc,char **argv){@autoreleasepool{
         if(argc==1){colour_case("default",1,0,0,0,0);colour_case("oversized",1,2,0,0,0);colour_case("MRT_min",0,0,0,0,1);plane_case("depth",0,0);plane_case("stencil",1,0);plane_case("depth_clear",0,1);plane_case("stencil_clear",1,1);}}
     printf("== %d 项，失败 %d ==\n",cases,failed);return failed!=0;
 }}
+
+// 无客体堆的图形夹具：报告未读到，不代表真机堆验证。
+// Graphics fixture without a guest heap: report unavailable, not device validation.
+int dm_guest_heap_stat(unsigned long long *t,unsigned long long *f,unsigned long long *m){*t=*f=*m=0;return 0;}

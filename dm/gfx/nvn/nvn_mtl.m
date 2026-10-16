@@ -19,7 +19,7 @@
 // Compile-time switch DM_NVN_M3=1: the graphics backend uses the older API (ordinary command queue / command buffers / render, compute and copy encoders, buffers bound per slot, each resource referenced by an argument block declared individually),
 // target macOS 15 / iOS 18. Default 0 = Metal 4 (macOS 26 / iOS 26). Both branches share the same replay logic, and every divergence is inside #if DM_NVN_M3
 #ifndef DM_NVN_M3
-#define DM_NVN_M3 0
+#define DM_NVN_M3 1
 #endif
 #if DM_NVN_M3
 #define RENC id<MTLRenderCommandEncoder>
@@ -125,18 +125,22 @@ static pthread_cond_t g_link_cv = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_link_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_link_tick_ns, g_link_tick_n;
 static uint64_t g_link_dropped;
+static _Atomic unsigned g_present_discard;
+static unsigned g_present_encoding;
 static int g_pq_inflight;   // 持 g_pq_mu：已提交给 GPU、完成回调还没来的上屏数 | Under g_pq_mu: number of presents committed to the GPU whose completion callback has not arrived yet
 int g_dm_present_link;   // 出图节拍模式（DM_PRESENT_LINK 的运行时值，同进程交替测量时直接改它）：0 = 自己取 drawable；1 = 显示节拍 60 Hz；2 = 120 Hz 节拍、游戏隔拍出一帧 | Present pacing mode (runtime value of DM_PRESENT_LINK, modified directly during same-process alternating measurement): 0 = acquire the drawable itself; 1 = display link at 60 Hz; 2 = display link at 120 Hz, the game presents a frame every other display-link tick
 static int g_present_latency = 1;
 static uint64_t g_pq_done;
 static uint64_t g_pq_read;
+#if !defined(DM_LEGACY_IOS17)
 static id<MTLResidencySet> g_res;
+#endif
 static int g_res_dirty;
 static id<MTLSharedEvent> g_ev;
 static uint64_t g_fence;                        // 已提交的最大栅栏值（提交线程独占递增） | Highest committed fence value (incremented exclusively by the submit thread)
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
-static uint64_t g_done;                         // 已完成的最大栅栏值（完成回调写） | Highest completed fence value (written by the completion callback)
+static _Atomic uint64_t g_done;                         // 已完成的最大栅栏值（完成回调写） | Highest completed fence value (written by the completion callback)
 static _Atomic int g_last_commit_error;
 static _Atomic int g_up_pending;
 
@@ -169,7 +173,9 @@ static NSHashTable *g_res_ever; static int g_res_census = -1;
 static void res_add(id<MTLResource> r) {
     if (!r) return;
     pthread_mutex_lock(&g_res_mu);
+#if !defined(DM_LEGACY_IOS17)
     [g_res addAllocation:(id<MTLAllocation>)r];
+#endif
     if (!g_res_objects) g_res_objects = [NSHashTable weakObjectsHashTable];
     [g_res_objects addObject:r];
 #if DM_NVN_M3
@@ -183,7 +189,9 @@ static void res_add(id<MTLResource> r) {
 static void res_remove(id<MTLResource> r) {
     if (!r) return;
     pthread_mutex_lock(&g_res_mu);
+#if !defined(DM_LEGACY_IOS17)
     [g_res removeAllocation:(id<MTLAllocation>)r];
+#endif
     [g_res_objects removeObject:r];
 #if DM_NVN_M3
     m3_buf_del(r);
@@ -208,7 +216,11 @@ static void res_check(id r, const char *what, int reg) {
 }
 static void res_commit(void) {
     pthread_mutex_lock(&g_res_mu);
-    if (g_res_dirty) { [g_res commit]; g_res_dirty = 0; }
+    if (g_res_dirty) {
+#if !defined(DM_LEGACY_IOS17)
+        [g_res commit];
+#endif
+        g_res_dirty = 0; }
     pthread_mutex_unlock(&g_res_mu);
 }
 
@@ -337,12 +349,16 @@ void mtl_init(void) {
 #if DM_NVN_M3
     stream_queue_once();
 #endif
+#if !defined(DM_LEGACY_IOS17)
     MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
     rd.initialCapacity = 4096;
     NSError *re = nil;
     g_res = [g_dev newResidencySetWithDescriptor:rd error:&re];
     if (!g_res) MDIE("建立 MTLResidencySet 失败");
     [g_q addResidencySet:g_res];
+#else
+    MLOG("iOS17：官方 DM_NVN_M3=1 后端；资源由逐编码器 useResource 声明，不调用 iOS18 驻留集");
+#endif
     { void crash_set_wait_dump(void (*fn)(void)); void mtl_wait_state_dump(void); crash_set_wait_dump(mtl_wait_state_dump); }
 #if !DM_NVN_M3
     dispatch_queue_attr_t feedback_attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
@@ -630,9 +646,31 @@ static void ser_gate(void) {
 // Only the one at the start is not enough: t_rt_range 'pass 1 → pass 2 → copy' read back black, and after adding the end barrier it is 19/19. Old-queue encoders (upload / diagnostics / present) do not go through these barriers.
 #if DM_NVN_M3
 static inline void m4_end(id e) { [e endEncoding]; }   // 老接口没有显式屏障：依赖关系由 useResource 声明 + 系统自动跟踪 | the older API has no explicit barriers: dependencies come from useResource declarations plus the system's automatic tracking
+#include "nvn_m3_bind_cache.h"
+static dm_m3_bind_cache g_m3_binding_cache;
+static _Atomic uint64_t g_m3_bind_native, g_m3_bind_skipped, g_m3_bind_offset;
+// Submit-thread only. The native encoder retains a bound buffer; valid bits are
+// reset on every encoder and nil bindings never use the offset-only API.
+static __unsafe_unretained id<MTLBuffer> g_m3_bound_buf[2][DM_M3_BIND_SLOTS];
+static int m3_offset_cache_on(void) {
+ static _Atomic int mode=-1;int v=atomic_load_explicit(&mode,memory_order_relaxed);if(v<0){const char *e=getenv("DM_M3_BIND_OFFSET");int parsed=!(e&&!atoi(e));if(atomic_compare_exchange_strong_explicit(&mode,&v,parsed,memory_order_relaxed,memory_order_relaxed))v=parsed;}return v;
+}
+static int m3_binding_cache_on(void) {
+ static _Atomic int mode=-1;int v=atomic_load_explicit(&mode,memory_order_relaxed);if(v<0){const char *e=getenv("DM_M3_BIND_CACHE");int parsed=!(e&&!atoi(e));if(atomic_compare_exchange_strong_explicit(&mode,&v,parsed,memory_order_relaxed,memory_order_relaxed))v=parsed;}return v;
+}
 static inline void m3_rbuf(id<MTLRenderCommandEncoder> e, int vertex, NSUInteger i, uint64_t gpu) {
-    NSUInteger off; id<MTLBuffer> b = m3_buf(gpu, &off); if (gpu && !b) { { static int n_; if (!n_++) MLOG("【红】" "老接口绑定：显卡地址 %#llx 不在任何登记过的缓冲里（槽 %lu）", (unsigned long long)gpu, (unsigned long)i); } return; }
-    if (vertex) [e setVertexBuffer:b offset:off atIndex:i]; else [e setFragmentBuffer:b offset:off atIndex:i];
+    int cached = m3_binding_cache_on() && i < DM_M3_BIND_SLOTS;
+    if (cached && dm_m3_bind_seen(&g_m3_binding_cache,vertex,(unsigned)i,gpu)) { atomic_fetch_add_explicit(&g_m3_bind_skipped,1,memory_order_relaxed); return; }
+    NSUInteger off; id<MTLBuffer> b = m3_buf(gpu, &off); if (gpu && !b) { { static int n_; if (!n_++) MLOG("【红】老接口绑定：显卡地址 %#llx 不在任何登记过的缓冲里（槽 %lu）", (unsigned long long)gpu, (unsigned long)i); } return; }
+    unsigned stage = vertex ? 0 : 1;
+    if (cached && b && (g_m3_binding_cache.valid[stage] & (UINT32_C(1) << i)) && g_m3_bound_buf[stage][i] == b && m3_offset_cache_on()) {
+        if (vertex) [e setVertexBufferOffset:off atIndex:i]; else [e setFragmentBufferOffset:off atIndex:i];
+        atomic_fetch_add_explicit(&g_m3_bind_offset,1,memory_order_relaxed);
+    } else {
+        if (vertex) [e setVertexBuffer:b offset:off atIndex:i]; else [e setFragmentBuffer:b offset:off atIndex:i];
+    }
+    atomic_fetch_add_explicit(&g_m3_bind_native,1,memory_order_relaxed);
+    if (cached) { dm_m3_bind_record(&g_m3_binding_cache,vertex,(unsigned)i,gpu); g_m3_bound_buf[stage][i] = b; }
 }
 #else
 static inline void m4_end(id e) {
@@ -641,7 +679,7 @@ static inline void m4_end(id e) {
 }
 #endif
 #if DM_NVN_M3
-static inline RENC enc_r_begin(RPD *d) { return [g_cb renderCommandEncoderWithDescriptor:d]; }
+static inline RENC enc_r_begin(RPD *d) { dm_m3_bind_reset(&g_m3_binding_cache); return [g_cb renderCommandEncoderWithDescriptor:d]; }
 #else
 static inline RENC enc_r_begin(RPD *d) { RENC e = [g_cb renderCommandEncoderWithDescriptor:d]; [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; return e; }
 #endif
@@ -1454,21 +1492,17 @@ static void res_census(unsigned long long frame, unsigned long long rss_mb) {
 }
 unsigned long long mtl_gpu_allocated_mb(void) { id<MTLDevice> d = g_dev; return d ? (unsigned long long)(d.currentAllocatedSize >> 20) : 0; }   // 显卡已分配（图形层还没起时 0）；任何线程可调 | GPU allocated (0 before the graphics layer starts); callable from any thread
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb, int heap_ok, unsigned long long heap_mb, unsigned long long heap_free_mb, unsigned long long heap_maxblk_kb) {
-    if (g_res_census > 0) res_census(frame, rss_mb);
-    static unsigned long long last_rss, last_gpu, last_frame, last_hfree, last_hmax; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
+    static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
-    unsigned long long dh = heap_free_mb > last_hfree ? heap_free_mb - last_hfree : last_hfree - heap_free_mb, hmax_mb = heap_maxblk_kb >> 10, dm = hmax_mb > last_hmax ? hmax_mb - last_hmax : last_hmax - hmax_mb;
-    static int all = -1; if (all < 0) all = getenv("DM_MEM_STAT_ALL") != NULL;   // 量测用：每次都打、不封顶 | For measurement: printed every time, uncapped
-    if (!all && (lines >= 400 || (lines && dr < 64 && dg < 64 && dh < 16 && dm < 16 && frame - last_frame < 3000))) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame; last_hfree = heap_free_mb; last_hmax = hmax_mb;
+    if (lines >= 400 || (lines && dr < 64 && dg < 64 && frame - last_frame < 3000)) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
     pthread_mutex_lock(&g_deferred_mu); unsigned long nd = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
     pthread_mutex_lock(&g_res_mu); unsigned long nr = (unsigned long)g_res_objects.count; pthread_mutex_unlock(&g_res_mu);
     int live = 0, peak = 0, cap = 0; nvn_dirty_stat(&live, &peak, &cap);
-    char avail[32] = "无";   // os_proc_available_memory：本进程离被系统按内存终止还差多少，只有 iOS 有；Mac 宿主写「无」 | os_proc_available_memory: how far this process is from being terminated by the system for memory, iOS only; the Mac host writes "none"
-#if TARGET_OS_IPHONE
-    snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
-#endif
-    MLOG("内存 至帧 %llu：常驻 %llu MB，显卡已分配 %llu MB，延迟释放队列 %lu，驻留集 %lu 个，内存池 %d 个（峰值 %d / 跟踪表容量 %d），贴图重传累计 %llu 次；游戏堆 %llu MB，余量 %llu MB，最大可分配块 %llu KB%s；离系统内存上限还有 %s", frame, rss_mb, gpu, nd, nr, live, peak, cap, (unsigned long long)g_pkg_reuploads,
-        heap_mb, heap_free_mb, heap_maxblk_kb, heap_ok ? "" : "（未读到）", avail);
+    MLOG("内存 至帧 %llu：常驻 %llu MB，显卡已分配 %llu MB，延迟释放队列 %lu，驻留集 %lu 个，内存池 %d 个（峰值 %d / 跟踪表容量 %d），贴图重传累计 %llu 次", frame, rss_mb, gpu, nd, nr, live, peak, cap, (unsigned long long)g_pkg_reuploads);
+    // 上游同口径的游戏堆数字；只在已有低频读数行输出。
+    // Upstream-compatible guest-heap figures, emitted only with the existing low-frequency readout.
+    MLOG("iOS17 游戏堆 至帧 %llu：total=%lluMiB free=%lluMiB maxblock=%lluKiB valid=%d",frame,heap_mb,heap_free_mb,heap_maxblk_kb,heap_ok);
+
 }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }
@@ -1549,7 +1583,6 @@ static void blit_note(void) { if (g_enc) PD("E %llu 拷贝 / 缓冲更新结束�
 // For intersecting with the inflate output ranges (which data decompressed before character select is really used by the character select screen). Columns: kind  guest_addr  len  first_frame  tex_id  fmt  w×h
 __attribute__((weak)) uint64_t dm_prof_ribbon_ns(void) { return 0; }   // diag.c 提供强定义；未合入时恒 0 → 时间窗不开，结束时报红 | diag.c provides the strong definition; when not merged it is always 0 → the time window does not open, and a failure is reported at the end
 __attribute__((weak)) void dm_shot_written(const char *path, int ok) { (void)path; (void)ok; }
-__attribute__((weak)) int dm_guest_heap_stat(unsigned long long *t, unsigned long long *f, unsigned long long *m) { (void)t; (void)f; (void)m; return 0; }   // hle_svc.c 提供强定义（游戏主堆读数）；图形单测不链宿主时读不到 | hle_svc.c provides the strong definition (game main heap readout); the graphics unit tests do not link the host and cannot read it
 __attribute__((weak)) void dm_guest_frame_tick(void) {}   // hle_os.c 提供强定义（DM_DETCLOCK 确定性客体时钟）；图形单测不链宿主时为空操作   // diag.c 提供强定义（DM_TICK_HOLD=E:SHOT 解冻）；图形单测不链宿主时为空操作 | hle_os.c provides the strong definition (DM_DETCLOCK deterministic guest clock); a no-op when graphics unit tests do not link the host   // diag.c provides the strong definition (DM_TICK_HOLD=E:SHOT unfreeze); a no-op when graphics unit tests do not link the host
 __attribute__((weak)) int dm_detclock_enabled(void) { return 0; }   // 同上：宿主 hle_os.c 提供强定义；图形单测不链宿主时确定性时钟视为关闭 | Same as above: the host's hle_os.c provides the strong definition; when graphics unit tests do not link the host, the deterministic clock is treated as off
 __attribute__((weak)) uint64_t guest_ns(void) { return 0; }          // 同上：仅在确定性时钟开启时被读，图形单测里不会走到 | Same as above: read only when the deterministic clock is on; never reached in graphics unit tests
@@ -1623,6 +1656,7 @@ typedef struct { uint64_t frame, pass; int idx, kind, w, h, draws, slot; uint32_
 #define PG_RING 8
 static int g_pg = -1; static FILE *g_pg_f;
 #if DM_NVN_M3
+static MTLCounterSampleBufferDescriptor *g_pg_descriptor;
 static id<MTLCounterSampleBuffer> g_pg_buf[PG_RING];
 #define PG_RSLOTS 4   // 渲染通道采样点：顶点起止、片元起止（阶段边界计数采样） | Render pass sample points: vertex start/end, fragment start/end (stage boundary counter sampling)
 #else
@@ -1646,7 +1680,7 @@ static int pg_on(void) {
     id<MTLCounterSet> ts = nil; for (id<MTLCounterSet> c in g_dev.counterSets) if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = c;
     if (!ts) { MLOG("【红】DM_NVN_PASSGPU：没有时间戳计数器集"); return 0; }
     MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
-    d.counterSet = ts; d.storageMode = MTLStorageModeShared; d.sampleCount = PG_SLOTS;
+    d.counterSet = ts; d.storageMode = MTLStorageModeShared; d.sampleCount = PG_SLOTS; g_pg_descriptor = d;
     for (int i = 0; i < PG_RING; i++) { NSError *er = nil; g_pg_buf[i] = [g_dev newCounterSampleBufferWithDescriptor:d error:&er]; if (!g_pg_buf[i]) { MLOG("【红】计数采样缓冲建不出：%s", er.localizedDescription.UTF8String); return 0; } }
 #else
     MTL4CounterHeapDescriptor *hd = [MTL4CounterHeapDescriptor new]; hd.type = MTL4CounterHeapTypeTimestamp; hd.count = PG_SLOTS;
@@ -1660,8 +1694,19 @@ static int pg_on(void) {
 }
 static void pg_sub_begin(uint64_t fence) {   // 本次提交用环里第 fence % PG_RING 块；先等 PG_RING 次之前用它的提交完成 | This submission uses block fence % PG_RING of the ring; first wait for the submission that used it PG_RING submissions ago to complete
     if (!pg_on()) return;
+    g_pg_b = (int)(fence % PG_RING);
+#if DM_NVN_M3
+    // Profiling only: do not reuse a timestamp buffer based solely on GPU completion.
+    // A CPU completion handler may still be resolving it. Each submission owns a fresh
+    // sample buffer; the encoder and completed-handler capture keep it alive independently.
+    NSError *error = nil;
+    id<MTLCounterSampleBuffer> fresh = [g_dev newCounterSampleBufferWithDescriptor:g_pg_descriptor error:&error];
+    if (!fresh) { MLOG("【红】逐通道计时缓冲分配失败，停止采样：%s",error.localizedDescription.UTF8String); g_pg=0; return; }
+    g_pg_buf[g_pg_b] = fresh;
+#else
     if (fence > PG_RING) mtl_wait(fence - PG_RING, UINT64_MAX);
-    g_pg_b = (int)(fence % PG_RING); g_pg_used = 0; g_pg_np = 0; g_pg_open = -1;
+#endif
+    g_pg_used = 0; g_pg_np = 0; g_pg_open = -1;
 }
 static pg_pass *pg_new(int kind, int nslot) {
     if (!pg_on() || g_pg_used + nslot > PG_SLOTS) return NULL;
@@ -1678,6 +1723,7 @@ static pg_pass *pg_new(int kind, int nslot) {
 // When moving to Metal 4 the descriptor lost its sample attachments, this whole block was short-circuited and the readback call at submission was deleted, so neither API produced numbers again; this restores it
 static void pg_render(RPD *pd, NSUInteger nc) {
     pg_pass *p = pg_new(0, PG_RSLOTS); if (!p) return;
+    p->pass = g_stat_pass + 1;
 #if DM_NVN_M3
     MTLRenderPassSampleBufferAttachmentDescriptor *a = pd.sampleBufferAttachments[0];
     a.sampleBuffer = g_pg_buf[g_pg_b];
@@ -4530,7 +4576,10 @@ static int bloomq_capture(void) {
     RENC en = [g_cb renderCommandEncoderWithDescriptor:rp]; if (!en) return 0;
 #if DM_NVN_M3
     [en setFragmentTexture:src atIndex:0]; [en setFragmentSamplerState:g_bloomq_samp atIndex:0];
-    float *p = g_bloomq_const[g_bloomq_i].contents; p[0] = g_bloomq.threshold; p[1] = g_bloomq.coeff_g; p[2] = g_bloomq.coeff_b; p[3] = src.width; p[4] = src.height; [en setFragmentBuffer:g_bloomq_const[g_bloomq_i] offset:0 atIndex:0];
+    // iOS17: one fence-protected snapshot per capture; no three-slot CPU ring reuse.
+    id<MTLBuffer> params; size_t params_off = arena_alloc(sizeof(float) * 8, &params);
+    float *p = (float *)((uint8_t *)params.contents + params_off); p[0] = g_bloomq.threshold; p[1] = g_bloomq.coeff_g; p[2] = g_bloomq.coeff_b; p[3] = src.width; p[4] = src.height;
+    [en setFragmentBuffer:params offset:params_off atIndex:0];
 #else
     [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [en setArgumentTable:g_bloomq_args atStages:MTLRenderStageFragment];
     [g_bloomq_args setTexture:src.gpuResourceID atIndex:0]; [g_bloomq_args setSamplerState:g_bloomq_samp.gpuResourceID atIndex:0];
@@ -5949,52 +5998,16 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src0, id<MTLTe
     [en endEncoding];
     return 1;
 }
-static int present_encode_m4(CBUF cb, id<MTLTexture> src0, id<MTLTexture> dst, const int crop[4], int uv_i) {
-    id<MTLTexture> src = present_src(src0);
-    NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
-    if (crop && (crop[2] || crop[3])) {
-        if (crop[0] < 0 || crop[1] < 0 || crop[2] <= 0 || crop[3] <= 0 ||
-            (uint64_t)crop[0] + crop[2] > src.width || (uint64_t)crop[1] + crop[3] > src.height) {
-            MLOG("【红】出图裁切越界：%d,%d %dx%d / 原纹理 %lux%lu", crop[0], crop[1], crop[2], crop[3], (unsigned long)src.width, (unsigned long)src.height); return 0;
-        }
-        cx = crop[0]; cy = crop[1]; cw = crop[2]; ch = crop[3];
-    }
-    present_pipeline(dst.pixelFormat);
-    double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
-    MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
-    if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
-    int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
-    RPD *rp = [RPD new];
-    rp.colorAttachments[0].texture = dst;
-    rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
-    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
-    RENC en = [cb renderCommandEncoderWithDescriptor:rp];
-    if (!en) { MLOG("【红】M4 出图渲染编码器创建失败"); return 0; }
-#if DM_NVN_M3
-    [en setFragmentTexture:src atIndex:0];
-    [en setFragmentSamplerState:g_blit_samp atIndex:0];
-#else
-    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
-    [en setArgumentTable:g_present_args atStages:MTLRenderStageFragment];
-    [g_present_args setTexture:src.gpuResourceID atIndex:0];
-    [g_present_args setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
-#endif
-    float *uv = g_present_uv[uv_i].contents;
-    uv[0] = (float)cx / src.width; uv[1] = (float)cy / src.height; uv[2] = (float)cw / src.width; uv[3] = (float)ch / src.height;
-    uv[4] = (cx + 0.5f) / src.width; uv[5] = (cy + 0.5f) / src.height; uv[6] = (cx + cw - 0.5f) / src.width; uv[7] = (cy + ch - 0.5f) / src.height;
-#if DM_NVN_M3
-    [en setFragmentBuffer:g_present_uv[uv_i] offset:0 atIndex:0];
-#else
-    [g_present_args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
-#endif
-    [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
-    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    m4_end(en);
-    return 1;
+static int present_encode_m4(CBUF cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i) {
+    (void)uv_i;
+    return present_encode(cb,src,dst,crop);
 }
 static double g_link_it_tin;   // 节拍回调正在上屏的那一帧的入队时刻（只在节拍线程读写） | Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
-static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
+static int present_now_impl(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
+    const int profile_sample = ticket % 300 == 0;
+    const uint64_t profile_start = profile_sample ? now_ns() : 0;
+    const uint64_t profile_cpu_start = profile_sample ? clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) : 0;
+
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
     if (g_use != USE_OFF && g_use != USE_DONE) use_tick();
@@ -6045,12 +6058,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     for (int i = 0; i < g_nshotq;) if (g_present_n >= g_shotq[i].frame) { mtl_finish_gpu(); shot(src, g_shotq[i].path, 1, crop); g_shotq[i] = g_shotq[--g_nshotq]; } else i++;
     pthread_mutex_unlock(&g_shotq_mu);
 
-    if (g_burst_left > 0) burst_grab(src);   // 测试：连拍 | test: burst capture
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     if (!layer) return 0;
-#if !DM_NVN_M3
-    if (g_present_layer_resident != layer) { [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
-#endif
 #if TARGET_OS_OSX
     if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // 窗口模式按显示器垂直同步，防撕裂 | Windowed mode follows the display's vsync to prevent tearing
 #endif
@@ -6061,36 +6070,15 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (!supplied) g_drawable_ns += now_ns() - dt0;
     if (!dr) return 0;
     int alloc_i = (int)(ticket % 3);
-    if (g_present_alloc_fence[alloc_i]) {
-        pthread_mutex_lock(&g_pq_mu);
-        while (g_pq_done < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
-        pthread_mutex_unlock(&g_pq_mu);
-    }
-#if DM_NVN_M3
-    CBUF cb = [g_q commandBuffer];   // 老接口：交画面记在命令缓冲上（presentDrawable），这一帧的绘制做完才上屏 | older API: presentation is recorded on the command buffer (presentDrawable), so the frame reaches the screen only after its drawing is done
-    if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) return 0;
-#else
-    [g_present_alloc4[alloc_i] reset];
-    [g_q4 waitForDrawable:dr];
-    CBUF cb = g_present_cb[alloc_i];
-    [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
-    if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
-    [cb endCommandBuffer];
-#endif
-#if !DM_NVN_M3
-    MTL4CommitOptions *o = [MTL4CommitOptions new];
-#endif
-    [FB_ON(o, cb) FB_SEL:^(FB_ARG f) {
+    id<MTLCommandBuffer> cb = [g_q commandBuffer];
+    if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { return 0; }
+    id<MTLCommandBuffer> o = cb;
+    [o addCompletedHandler:^(id<MTLCommandBuffer> f) {
         if (f.error) MLOG("【红】上屏命令缓冲错误：%s", f.error.description.UTF8String);
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }];
-#if !DM_NVN_M3
-    CBUF buffers[] = {cb};
-#endif
     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
-#if !DM_NVN_M3
-    [g_q4 commit:buffers count:1 options:o];
-#endif
+
     if (target_ts > 0) {
         static double leads[300], e2e[300];   // e2e：游戏入队 → 系统预定上屏（含在队列里等节拍回调的时间），输入延迟里我们这一侧能读到的全程 | e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
         static uint64_t lead_n;
@@ -6106,12 +6094,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                  (unsigned long long)g_link_dropped, a[149], a[0], b[149], b[0], b[299]);
         }
     }
-#if !DM_NVN_M3
-    [g_q4 signalDrawable:dr];
-#endif
-    g_present_alloc_fence[alloc_i] = ticket;
 #if TARGET_OS_SIMULATOR   // iOS 模拟器 SDK 没有呈现时刻回调与最短显示时长（只作画面验收用，不计节拍） | The iOS simulator SDK has no presentation-time callback and no minimum display duration (used only for picture acceptance, display-link ticks are not counted)
-    (void)period; M3_PRESENT(cb, dr);
+    (void)period;
 #else
     uint64_t pn = ticket;   // 按游戏出图序号（票号）记上屏时刻：hle 的上屏统计按「游戏第 n 次出图」取；显示节拍路径里实际出图次数 ≠ 游戏出图次数（旧帧会被合并丢弃） | Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // 真实呈现时刻（屏幕上真正换上这一帧的时间，CACurrentMediaTime 基准） | Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
@@ -6120,18 +6104,47 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     }];
     // 每张至少显示一个出图周期：GPU 完成时刻在 120 Hz 刷新边界附近抖动时，不再出现「25 ms + 8.33 ms」成对的顿挫
     // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
-#if DM_NVN_M3
-    if (target_ts <= 0 && period > 0) [cb presentDrawable:dr afterMinimumDuration:period]; else [cb presentDrawable:dr];
-#else
-    if (target_ts > 0) [dr present];
-    else if (period > 0) [dr presentAfterMinimumDuration:period]; else [dr present];
-#endif
-#endif
-#if DM_NVN_M3
-    [cb commit];
+    (void)period; // CAMetalDisplayLink owns pacing; do not enqueue a command-buffer presentation.
 #endif
     (void)frame;
+    // CAMetalDisplayLink requires rendering commits before drawable presentation.
+    // Direct present also avoids minimum-duration presentation on this layer.
+    // 每300张采样一次，GPU回调仅输出自己的command buffer，不把它当整帧耗时。
+    // Sample once per 300 presents; GPU callback reports only this command buffer, not whole-frame cost.
+    if (profile_sample) {
+        const uint64_t sampled_ticket = ticket, sampled_frame = frame;
+        const double wall_ms = (now_ns()-profile_start)/1e6;
+        const double cpu_ms = (clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)-profile_cpu_start)/1e6;
+        const double queue_ms = supplied && g_link_it_tin ? (CACurrentMediaTime()-g_link_it_tin)*1000.0 : -1;
+        const double lead_ms = target_ts>0 ? (target_ts-CACurrentMediaTime())*1000 : -1;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            double cb_ms = done.GPUEndTime>=done.GPUStartTime ? (done.GPUEndTime-done.GPUStartTime)*1000 : -1;
+            MLOG("iOS17 呈现采样 ticket=%llu frame=%llu queue=%.3fms encode_wall=%.3fms encode_cpu=%.3fms target_lead=%.3fms present_cb_gpu=%.3fms status=%lu", (unsigned long long)sampled_ticket,(unsigned long long)sampled_frame,queue_ms,wall_ms,cpu_ms,lead_ms,cb_ms,(unsigned long)done.status);
+        }];
+    }
+    // Drawable writes are registered at Scheduled, not merely at commit return.
+    // Keep direct present for CAMetalDisplayLink, but defer it asynchronously until registration.
+    [cb addScheduledHandler:^(id<MTLCommandBuffer> scheduled) {
+        (void)scheduled;
+        [dr present];
+    }];
+    [cb commit];
+#if DM_NVN_M3
+    if (ticket % 300 == 0) MLOG("iOS17 直接缓冲绑定：native=%llu skipped=%llu cache=%s offset=%llu",(unsigned long long)atomic_load_explicit(&g_m3_bind_native,memory_order_relaxed),(unsigned long long)atomic_load_explicit(&g_m3_bind_skipped,memory_order_relaxed),m3_binding_cache_on()?"on":"off",(unsigned long long)atomic_load_explicit(&g_m3_bind_offset,memory_order_relaxed));
+#endif
+    static unsigned legacy_present_logged;
+    if (legacy_present_logged++ < 4) MLOG("iOS17 出图：commit → scheduled → drawable.present（来源 %s，票号 %llu）", supplied ? "DisplayLink" : "classic", (unsigned long long)ticket);
+
     return 1;
+}
+static int present_now(const tex_t *t,double period,uint64_t frame,uint64_t ticket,const int crop[4],id<CAMetalDrawable> supplied,double target_ts) {
+    pthread_mutex_lock(&g_pq_mu);
+    if (atomic_load(&g_present_discard)) { pthread_mutex_unlock(&g_pq_mu); return 0; }
+    g_present_encoding++;
+    pthread_mutex_unlock(&g_pq_mu);
+    int result=present_now_impl(t,period,frame,ticket,crop,supplied,target_ts);
+    pthread_mutex_lock(&g_pq_mu);g_present_encoding--;pthread_cond_broadcast(&g_pq_cv);pthread_mutex_unlock(&g_pq_mu);
+    return result;
 }
 // ---------- 出图线程 ----------
 // NVN 语义：QueuePresentTexture 只把出图排进队列、立即返回（游戏常持锁调用它；iOS 真机：在里面同步等 nextDrawable
@@ -6212,9 +6225,10 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
 static CAMetalDisplayLink *g_link; static CFRunLoopRef g_link_rl; static int g_link_started;
 static int g_link_owns_layer, g_classic_busy;   // 持 g_pq_mu：图层挂着节拍对象期间 nextDrawable 会抛异常，自取 drawable 的出图线程与节拍对象互斥 | Under g_pq_mu: nextDrawable throws while the layer has the display link object attached, so the present thread that takes its own drawable and the display link object are mutually exclusive
 static int link_on(void) { return g_dm_present_link && g_link != nil; }
-static CAFrameRateRange link_range(int mode) {   // 1 / 3 按屏幕刷新率选整除的那一档（mtl_pace_hz）；2（120 Hz 节拍、测试档）不变 | 1 / 3 pick the evenly dividing tier by screen refresh rate (mtl_pace_hz); 2 (120 Hz pacing, test tier) unchanged
-    if (mode == 2) return CAFrameRateRangeMake(60, 120, 120);
-    float r = (float)mtl_pace_hz(); return CAFrameRateRangeMake(r, r, r); }
+static CAFrameRateRange link_range(int mode) { return mode == 3 ? CAFrameRateRangeMake(60, 60, 60) : mode == 2 ? CAFrameRateRangeMake(60, 120, 120) : CAFrameRateRangeMake(60, 60, 60); }
+// iOS17 candidate: service drawable callbacks at60Hz, render only everytwo callbacks ineco30.
+// This is not frame generation: one real gameframe per producerstep; no extra renderedframes.
+static uint64_t link_producer_step(int mode, int source) { return mode == 3 ? 2 : source == 2 ? 2 : 1; }
 static int g_link_mode = 1;   // 节拍对象当前的模式：1 / 2 同 g_dm_present_link，3 = 省电模式 30 Hz | Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
 static void *link_main(void *arg) {   // 显示节拍线程：切到节拍模式时起，切回 0 时退出 | Display link thread: started when switching to display-link mode, exits when switching back to 0
     (void)arg;
@@ -6271,16 +6285,15 @@ static void link_sync(void) {   // 游戏出图线程每帧调：把节拍对象
 // These frames will not be seen anyway: discard them directly (accounted as dropped frames) and only wait for the one present already submitted to the GPU to finish.
 static void present_drop_for_suspend(void) {
     pthread_mutex_lock(&g_pq_mu);
-    if (g_link_owns_layer) {
-        uint64_t n = g_pq_in - g_pq_read;
-        for (uint64_t k = g_pq_read + 1; k <= g_pq_in; k++) g_pres[k % PRING] = (pres_ent){k, -1};
-        g_link_dropped += n; g_pq_read = g_pq_in;
-        while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
-        if (g_pq_done < g_pq_in) g_pq_done = g_pq_in;
-        pthread_cond_broadcast(&g_pq_cv);
-        if (n) MLOG("进后台：丢弃排队中未上屏的 %llu 帧（显示节拍在后台不回调）", (unsigned long long)n);
-    }
+    while (g_present_encoding) pthread_cond_wait(&g_pq_cv,&g_pq_mu);
+    uint64_t n=g_pq_in-g_pq_read;
+    for(uint64_t k=g_pq_read+1;k<=g_pq_in;k++)g_pres[k%PRING]=(pres_ent){k,-1};
+    g_link_dropped+=n;g_pq_read=g_pq_in;
+    while(g_pq_inflight)pthread_cond_wait(&g_pq_cv,&g_pq_mu);
+    if(g_pq_done<g_pq_in)g_pq_done=g_pq_in;
+    pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
+    if(n)MLOG("呈现门：丢弃 %llu 个排队帧，编码和在途出图已排空",(unsigned long long)n);
 }
 static void *present_main(void *arg) {
     (void)arg;
@@ -6307,7 +6320,7 @@ static void *present_main(void *arg) {
 }
 uint32_t mtl_present_qos(void) { return atomic_load(&g_present_qos); }
 static void present_start(void) { pthread_t th; if (pthread_create(&th, NULL, present_main, NULL)) MDIE("出图线程起不来"); pthread_detach(th); }
-static _Atomic int g_present_discard;
+
 void mtl_link_pause(int on);
 // 前端进后台、等游戏存盘那一小段：出图直接丢（显示节拍后台不回调，入队会把游戏线程堵住；画面也没人看）。
 // 打开时把已经排着队的帧一并清掉：系统是先停节拍回调、之后才通知进后台，这段空档里游戏已把交换链画满，正卡在「取下一张贴图前等它上一次出图处理完」
@@ -6315,7 +6328,13 @@ void mtl_link_pause(int on);
 // The short period when the front end goes to the background and waits for the game to save: presents are dropped directly (the display link does not call back in the background, enqueueing would block the game thread; nobody sees the picture anyway).
 // When turned on, also clear the frames already queued: the system first stops the display-link callback and only afterwards notifies about going to the background, and in that gap the game has already filled the swapchain and is stuck at "before acquiring the next texture, wait for its previous present to be processed"
 // (hle_nvn.c nvnWindowAcquireTexture -> mtl_present_wait). Without clearing, the game cannot advance a single tick during those 2.5 seconds of waiting for the save, and the save is not written (the same pattern three times in player logs: 3 frames queued, 0 submits)
-void mtl_present_discard(int on) { atomic_store(&g_present_discard, on != 0); if (on) present_drop_for_suspend(); }
+void mtl_present_discard_reason(unsigned reason,int on) {
+    if(reason>=2)MDIE("invalid present gate owner %u",reason);
+    unsigned bit=1u<<reason;
+    if(on){atomic_fetch_or(&g_present_discard,bit);present_drop_for_suspend();}
+    else atomic_fetch_and(&g_present_discard,~bit);
+}
+void mtl_present_discard(int on) { mtl_present_discard_reason(0,on); }
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     if (atomic_load(&g_present_discard)) return 0;   // 票号 0 = 没有待完成的上屏，取交换链贴图处不等 | Ticket number 0 = no pending present; the swapchain texture acquire does not wait
     if (t) { xv_check(t->serial, 0, 0, "出图"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial; }
@@ -6394,7 +6413,7 @@ int mtl_link_wait_tick(uint64_t timeout_ns) {
     // Wait for the display link only when running faster than the display: if a display-link tick has already passed since the previous frame started work (this frame is already behind), start immediately instead of waiting in vain for the next display-link tick --
     // otherwise when the frame time is slightly more than one display-link period it would "miss the tick -> wait another whole tick", locking the frame rate straight to half (measured on Mac under windowed load: runs of dropped frames)
     static uint64_t started_tick;   // 上一帧开工时的节拍号（只有游戏出图线程调本函数） | Display-link tick number when the previous frame started work (only the game's present thread calls this function)
-    const uint64_t step = g_dm_present_link == 2 ? 2 : 1;   // 一帧占几拍：60 Hz 节拍 1 拍；120 Hz 节拍 2 拍（游戏仍按 60 帧出） | How many display-link ticks one frame takes: 1 with a 60 Hz display link; 2 with a 120 Hz display link (the game still outputs 60 frames)
+    const uint64_t step = link_producer_step(g_link_mode, g_dm_present_link);   // 一帧占几拍：60 Hz 节拍 1 拍；120 Hz 节拍 2 拍（游戏仍按 60 帧出） | How many display-link ticks one frame takes: 1 with a 60 Hz display link; 2 with a 120 Hz display link (the game still outputs 60 frames)
     pthread_mutex_lock(&g_link_mu);
     if (g_link_tick_n >= started_tick + step) { started_tick = g_link_tick_n; pthread_mutex_unlock(&g_link_mu); return 1; }
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);

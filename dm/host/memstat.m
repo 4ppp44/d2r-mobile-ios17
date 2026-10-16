@@ -157,12 +157,18 @@ static void *thrcpu_thread(void *p) {
     }
     return NULL;
 }
-__attribute__((constructor)) static void thrcpu_start(void) {
+// main设置可选诊断档后也可启动；构造器与main共用闸门，避免双采样线程。
+// Can also start after main selects an optional profile; constructor/main share a guard.
+void dm_thrcpu_start_if_requested(void) {
     const char *p = getenv("DM_THRCPU");
     if (!p || !*p) return;
+    static int started; if (__atomic_exchange_n(&started,1,__ATOMIC_ACQ_REL)) return;
     char *spec = strdup(p);
 #if TARGET_OS_IPHONE
     if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; spec = malloc(n); snprintf(spec, n, "%s/Documents/%s", getenv("HOME"), p); }
 #endif
-    pthread_t th; pthread_create(&th, NULL, thrcpu_thread, spec); pthread_detach(th);
+    pthread_t th;
+    if (pthread_create(&th,NULL,thrcpu_thread,spec)) { free(spec); __atomic_store_n(&started,0,__ATOMIC_RELEASE); return; }
+    pthread_detach(th);
 }
+__attribute__((constructor)) static void thrcpu_start(void) { dm_thrcpu_start_if_requested(); }

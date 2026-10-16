@@ -361,6 +361,8 @@ static const struct { const char *k, *zh, *en; } k_dm_i18n[] = {
     { "dmAppShareLog", "分享日志…", "Share Logs…" },
     { "dmAppShareInfo", "版本信息", "Version Info" },
     { "dmAppShareFail", "日志打包失败", "Could Not Pack the Logs" },
+    { "dmCustomLangEn", "语言 / Language：English", "Language: English" },
+    { "dmCustomLangHint", "重启游戏后生效 / Restart to apply", "Restart to apply" },
     { "dmTvChecking", "正在检查游戏文件…", "Checking game files…" },
     { "dmTvNoRomfs", "游戏文件还不齐全：\n%s", "The game files are incomplete:\n%s" },
     { "dmTvNoAstcIndex", "老机型补充包的覆盖层索引不在（romfs_overlay_astc/data/.build.config）", "The Legacy Device Pack index is missing (romfs_overlay_astc/data/.build.config)" },

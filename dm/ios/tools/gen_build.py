@@ -26,7 +26,11 @@ while i < len(toks):
 assert srcs, '编译命令里没有源文件'
 dup = sorted({s for s in srcs if srcs.count(s) > 1})
 if dup: sys.exit('编译命令里源文件重复（Makefile 显式列与通配重叠？）：' + ' '.join(dup))
-os.makedirs(f'{gen}/src'); os.makedirs(f'{gen}/main')
+os.makedirs(f'{gen}/src', exist_ok=True); os.makedirs(f'{gen}/main', exist_ok=True)
+def stable_link(src, dst):
+    if os.path.lexists(dst):
+        assert os.path.islink(dst) and os.readlink(dst) == src, "existing Gen link differs"
+    else: os.symlink(src, dst)
 dirs = []
 for s in srcs:
     d = os.path.dirname(s)
@@ -34,9 +38,9 @@ for s in srcs:
     b = os.path.basename(s)
     if os.path.splitext(b)[0].endswith('_mac'): continue   # Mac 专用源按 _mac 命名约定不进 iOS（front_mac.m 由 front_ios.m 实现 front.h；touch_mac.c 是 Mac 触点脚本） | Mac-only sources are kept out of iOS by the _mac naming convention (for front_mac.m, front_ios.m implements front.h; touch_mac.c is the Mac touch point script)
     if os.path.dirname(s) == os.path.normpath(os.path.join(host, '../ios/Sources')): continue   # 宿主借用的 iOS 源（如触屏模块）iOS 工程本身已编，再收一份会重复链接 | iOS sources borrowed by the host (e.g. the touch module) are already compiled by the iOS project itself; collecting another copy would link them twice
-    if s == os.path.join(host, 'main.c'): os.symlink(s, f'{gen}/main/main.c'); continue
+    if s == os.path.join(host, 'main.c'): stable_link(s, f'{gen}/main/main.c'); continue
     flat = os.path.relpath(s, os.path.dirname(host)).replace('/', '__')   # 不同目录同名文件不冲突 | Same-named files in different directories do not collide
-    os.symlink(s, f'{gen}/src/{flat}')
+    stable_link(s, f'{gen}/src/{flat}')
 print('HEADER_SEARCH_PATHS = $(inherited) ' + ' '.join(f'"{d}"' for d in incs + dirs))
 print('OTHER_CFLAGS = $(inherited) ' + ' '.join(defs))
 print('DM_FRAMEWORKS = ' + ' '.join(f'-framework {f}' for f in fws if f != 'Cocoa'))

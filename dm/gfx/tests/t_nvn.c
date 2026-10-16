@@ -10,6 +10,9 @@ void *front_metal_layer(void) { return NULL; }   // 单测无窗口：出图只�
 module_t *module_of(const void *p) { (void)p; return NULL; }   // 单测无客体模块 | no guest modules in unit tests
 module_t g_mod[MAX_MOD]; int g_nmod;                            // crash.c 依赖的宿主符号 | host symbols that crash.c depends on
 void svc_thread_dump(void) {}
+// 无客体堆的单测替身，输出未读到；不替代真实设备验证。
+// No guest heap in this fixture; report unavailable, not device proof.
+int dm_guest_heap_stat(unsigned long long *t,unsigned long long *f,unsigned long long *m){*t=*f=*m=0;return 0;}
 void crash_install(void);
 void nvn_present_config(int hz, int display_mode);
 #include <fcntl.h>
