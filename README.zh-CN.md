@@ -1,6 +1,6 @@
 # D2R Mobile：iOS 17 / A16 实验性适配
 
-这是[jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)的非官方仅源码适配，基于v1.0.17（9de307e），包含后续Mac反射复制修复1784563。保留上游历史、署名和MIT许可证；不是暴雪官方发行或上游的iOS17支持承诺。
+这是[jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)的非官方、无游戏载荷宿主适配，基于v1.0.17（9de307e），包含后续Mac反射复制修复1784563。保留上游历史、署名和MIT许可证；不是暴雪官方发行或上游的iOS17支持承诺。
 
 兼容实现包含iOS17逐编码器资源声明、泛光/系统UI快照保护、GPU进入Scheduled后直接呈现，以及省电档60Hz显示服务/每两拍生成一张真实游戏帧，名义30FPS，不插帧。
 
@@ -11,3 +11,7 @@
 [构建与限制](docs/IOS17.md) · [来源与验证范围](docs/IOS17_PROVENANCE.md) · [上游说明](README.zh-CN.upstream.md)
 
 辅助脚本只做未签名源码构建，不自动安装/启动手机或导出IPA。签名方式影响内存权限，不承诺普通自签与巨魔等价；换bundleID不会自动迁移存档或资源。
+
+
+## 壳构建原料预发布
+Release提供与源码匹配的iOS17宿主壳ZIP，不是可直接玩的IPA。使用者通过`dm/tools/d2rm_pack.py`从自己的游戏文件在本地生成游戏程序和衍生资源；发布附件不含这些内容。[操作说明](docs/NO_XCODE.zh-CN.md)。游戏动态库生成器的最低版本同步为17.0，不再沿用上游的26.0。

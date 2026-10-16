@@ -47,3 +47,6 @@ J=4 IOSOUT="$DM_ROOT/build/ios/dmsh_b" python3 dm/gfx/tools/dmsh_build.py \
   "$DM_ROOT/build/cache/dm/dmsh" "$DM_ROOT/build/gfx/dmsh_b"
 ```
 The input directory must contain shaders extracted from your own game by upstream setup. All translated libraries/reflection records must match the new chain. Never rename a pre-existing b-* directory to bypass validation.
+
+## Shell releases
+Use the same release-tag source with the iOS17 shell build-input ZIP; see [NO_XCODE](NO_XCODE.md). The ZIP is not installable and contains no guest program or game-derived payloads. Guest Mach-O/plist minOS is17.0. This dynamic-guest loading route is distinct from the earlier private embedded1601 test; local reconstruction and build tests are not new A16 gameplay proof.

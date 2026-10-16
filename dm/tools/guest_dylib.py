@@ -29,7 +29,7 @@
 import hashlib, os, struct, sys
 
 PG = 0x4000
-MIN_IOS = 26 << 16   # 与工程的最低系统版本一致（ios/project.yml） | matches the project's minimum system version (ios/project.yml)
+MIN_IOS = 17 << 16   # 与工程的最低系统版本一致（ios/project.yml） | matches the project's minimum system version (ios/project.yml)
 
 
 def r16(x): return (x + PG - 1) & ~(PG - 1)
@@ -92,7 +92,7 @@ INFO_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
 <key>CFBundlePackageType</key><string>FMWK</string>
 <key>CFBundleShortVersionString</key><string>1.0</string>
 <key>CFBundleVersion</key><string>1</string>
-<key>MinimumOSVersion</key><string>26.0</string>
+<key>MinimumOSVersion</key><string>17.0</string>
 <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
 </dict></plist>
 '''

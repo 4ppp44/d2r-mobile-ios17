@@ -8,3 +8,5 @@
 - Current-device1601 sample is about one minute on A16/iOS17.0: later reported intervals33.36ms, earlyp99up to100.08ms, thermal state0. Fixed25ms dropped threshold mislabels normal30FPS. No claim of sustained watts, touch latency or full-game correctness.
 - Prior regression evidence includes31 changed production sources strictly compiled foriOS17,75NVN/32crop/23pace/32realMetal presentation cases and a10-entry Mac save/re-entry test with39ordered transitions. These are limited-scope tests, not A16 certification.
 - Final exact-path privacy/source-hash verification is required before publication. No private artifacts may be committed.
+
+- Shell preview follows upstream DM_SHELL/stubs/derived-manifest separation. iOS17 shell builder uses native PNG icons, direct deviceSDK target selection and debug/source-path stripping; guest framework writer minOS/plist both17.0. Shell game-content audit and local source-matched reconstruction are separate from earlier embedded1601 device observations; see Release for exact passed gates and untested scope. No full game IPA is a public asset.
