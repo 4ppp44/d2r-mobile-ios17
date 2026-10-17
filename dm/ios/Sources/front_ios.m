@@ -825,18 +825,15 @@ static void touch_ui_message(const char *cat,const char *act,const char *arg) {
 }
 
 // 主线程调用：建全屏 Metal 视图，图形后端经 front_metal_layer 取它的层出图
-// ProMotion 帧率申请：iPhone 上 App 自己调 nextDrawable / present 时系统缺省按 60 Hz 给画布（真机：只加 Info.plist 的
-// CADisableMinimumFrameDurationOnPhone 仍 60 帧、等画布 16.6 ms）。挂一个只表态的 CADisplayLink（回调空）申请 80–120 Hz，系统才切到 120 Hz。
-// Called on the main thread: creates the fullscreen Metal view; the graphics backend gets its layer through front_metal_layer to present frames
-// ProMotion frame rate request: on iPhone, when the App calls nextDrawable / present itself, the system by default hands out drawables at 60 Hz (real device: adding only Info.plist's
-// CADisableMinimumFrameDurationOnPhone still gives 60 fps and a 16.6 ms drawable wait). Attach a declaration-only CADisplayLink (empty callback) requesting 80–120 Hz, and only then does the system switch to 120 Hz.
-@interface DmRateHint : NSObject
-- (void)tick:(CADisplayLink *)l;
+// iOS17 normal play: only the Metal display link requests display cadence.
+// UI/input polling stays at60Hz independently of render30; no second refresh hint.
+#include "dm_input_tick.h"
+@interface DmInputTick : NSObject
+- (void)tick:(NSTimer *)timer;
 @end
-@implementation DmRateHint
-- (void)tick:(CADisplayLink *)l {
-    extern int mtl_fps_target(void);
-    { static int last = -1; int f = mtl_fps_target(); if (f != last) { last = f; l.preferredFrameRateRange = f == 30 ? CAFrameRateRangeMake(30, 30, 30) : CAFrameRateRangeMake(60, 60, 60); } }   // 省电模式（30 帧）：帧率提示一起降，ProMotion 屏才会真降刷新率 | Power-saving mode (30 fps): lower the frame rate hint as well; only a ProMotion screen actually lowers the refresh rate
+@implementation DmInputTick
+- (void)tick:(NSTimer *)timer {
+    (void)timer;
     DmMetalView *v = g_touch_view;
     if (v) {
         if (g_full) { static int lx = -1, ly, lw, lh, lrh, lrw; int x, y, w, h, rw = 0, rh = 0; dm_ui_rect(&x, &y, &w, &h);   // 界面矩形由宿主定（开机后才有、切档会变）：变了就让容器重摆游戏视图 | The UI rectangle is decided by the host (available only after boot, changes when the profile switches): on change, have the container re-lay out the game view
@@ -846,14 +843,14 @@ static void touch_ui_message(const char *cat,const char *act,const char *arg) {
     }
 }
 @end
-static CADisplayLink *g_rate_link;
-// 固定 60 Hz 表态 + 每帧刷新触屏绑定快照。
+static NSTimer *g_input_timer;
+// 独立60Hz输入/UI采样，不额外声明显示刷新率。
 // 游戏视图 = 窗口里居中的、与游戏画面同宽高比的最大矩形，外面一层黑底。出图本来就是「保持画面比例居中、余下留黑边」（nvn_mtl.m present_encode），
 // 而触摸层、自绘底栏、血球、技能钮、摇杆、安全区、给宿主的归一化坐标全都从游戏视图自己的 bounds 取——视图若是整个窗口，窗口比例与画面比例一不同，
 // 自绘的东西就落到黑边里、触点也对不上（mini 上强制 DM_GAME_RES=2868x1320：画面 2.17:1、窗口 16:9，底栏画成两条、拖卖落背景、点箱子落空地；
 // iPad 4:3 窗口对 16:9 画面同理）。画面比例取 front_game_res（已含 16:9 下限与 DM_GAME_RES）。比例差 < 1% 当作相同、铺满（与出图那边同一个容差）：
 // iPhone 真机画面比例 = 屏幕比例，走这条，不套容器，行为不变。
-// Fixed 60 Hz declaration + refresh the touch binding snapshot every frame.
+// Independent60Hz input/UI polling; no additional display-rate declaration.
 // Game view = the largest rectangle centered in the window with the same aspect ratio as the game picture, with a black base around it. Output was always "keep the picture aspect ratio, center, black bars for the rest" (nvn_mtl.m present_encode),
 // while the touch layer, custom-drawn bottom bar, orbs, skill buttons, stick, safe area and the normalized coordinates given to the host all come from the game view's own bounds -- if the view is the whole window, as soon as the window ratio differs from the picture ratio,
 // custom-drawn things fall into the black bars and touch points no longer line up (on the second Mac with DM_GAME_RES=2868x1320 forced: picture 2.17:1, window 16:9, the bottom bar is drawn as two strips, drag-to-sell lands on the background, tapping a chest lands on empty ground;
@@ -893,9 +890,9 @@ UIView *front_ios_view(CGRect frame) {
     CGRect full = frame; frame = letterbox_rect(frame);
     dm_tc_set_tall_scale(1);   // 真 UIKit 点数：比手机高的画面（iPad）控件等比放大 | Real UIKit points: on pictures taller than a phone's (iPad) widgets scale up proportionally
     DmMetalView *v = [[DmMetalView alloc] initWithFrame:frame];
-    g_rate_link = [CADisplayLink displayLinkWithTarget:[DmRateHint new] selector:@selector(tick:)];
-    g_rate_link.preferredFrameRateRange = CAFrameRateRangeMake(60, 60, 60);
-    [g_rate_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    // CAMetalDisplayLink alone declares game refresh. Keep all input/layout work,
+    // at60Hz even in render30, without an additional CADisplayLink60 declaration.
+    g_input_timer = dm_input_tick_start([DmInputTick new],@selector(tick:));
     g_layer = (CAMetalLayer *)v.layer;
     g_layer.device = MTLCreateSystemDefaultDevice();
     g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -1559,15 +1556,20 @@ void front_ios_heat_start(uint64_t (*presents)(void), int has_gpu) {
     char rel[512]; snprintf(rel, sizeof rel, "%.*s", (int)strcspn(e, ","), e); const char *c = strchr(e, ','); int iv = c ? atoi(c + 1) : 10;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
     FILE *f = fopen([doc stringByAppendingPathComponent:@(rel)].fileSystemRepresentation, "w"); if (!f) return;
-    fprintf(f, "秒\t温控\tCPU%%\t出图帧率\tGPU均值ms\tGPU_p95ms\tGPU样本\t亮度\t最高刷新\n"); fflush(f);
+    UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+    fprintf(f, "秒\t温控\tCPU%%\t出图帧率\tGPU均值ms\tGPU_p95ms\tGPU样本\t亮度\t最高刷新\tsample_ms\tbattery_state\tbattery_level\tlow_power\tuptime_s\tactive_interval\twall_ns\n"); fflush(f);
     __block uint64_t t0 = now_ns(), tl = t0, pl = presents(); __block double cl = 0;
     { struct rusage ru; getrusage(RUSAGE_SELF, &ru); cl = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6; }
+    // A tick ending in foreground can still include background/system-UI time.
+    __block NSUInteger lifecycle_epoch=0, previous_epoch=0;
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){(void)n;lifecycle_epoch++;}];
     [NSTimer scheduledTimerWithTimeInterval:iv repeats:YES block:^(NSTimer *tm) { (void)tm;
         uint64_t t = now_ns(), p = presents(); struct rusage ru; getrusage(RUSAGE_SELF, &ru);
         double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6, dt = (t - tl) / 1e9;
         double ga = -1, gp = -1; unsigned gn = 0; if (has_gpu) nvn_gpu_recent(&ga, &gp, &gn);
-        fprintf(f, "%.0f\t%ld\t%.1f\t%.1f\t%.2f\t%.2f\t%u\t%.2f\t%ld\n", (t - t0) / 1e9, (long)NSProcessInfo.processInfo.thermalState, (cpu - cl) / dt * 100,
-                (p - pl) / dt, ga, gp, gn, UIScreen.mainScreen.brightness, (long)UIScreen.mainScreen.maximumFramesPerSecond);
+        fprintf(f, "%.3f\t%ld\t%.3f\t%.3f\t%.3f\t%.3f\t%u\t%.3f\t%ld\t%.3f\t%ld\t%.3f\t%d\t%.9f\t%d\t%llu\n", (t-t0)/1e9,(long)NSProcessInfo.processInfo.thermalState,(cpu-cl)/dt*100,
+                (p-pl)/dt,ga,gp,gn,UIScreen.mainScreen.brightness,(long)UIScreen.mainScreen.maximumFramesPerSecond,(now_ns()-t)/1e6,(long)UIDevice.currentDevice.batteryState,UIDevice.currentDevice.batteryLevel,NSProcessInfo.processInfo.lowPowerModeEnabled,t/1e9,dt<iv+5 && lifecycle_epoch==previous_epoch && UIApplication.sharedApplication.applicationState==UIApplicationStateActive,(unsigned long long)(t-tl));
+        previous_epoch=lifecycle_epoch;
         fflush(f); tl = t; pl = p; cl = cpu; }];
 }
 
@@ -1575,8 +1577,10 @@ void front_ios_heat_start(uint64_t (*presents)(void), int has_gpu) {
 // 同一块屏、同样 60 帧出图，只清屏成中灰 RGB(50,50,50)（约等于游戏画面平均亮度，OLED 功耗随像素亮度变），看屏幕与显示链本身的发热
 // ---------- Heat negative control: minimal blank Metal picture (-mode blank) ----------
 // Same screen, same 60 fps output, only clears to mid grey RGB(50,50,50) (roughly the average brightness of the game picture; OLED power varies with pixel brightness), to see the heat of the screen and the display chain themselves
-static uint64_t g_blank_n;
-uint64_t front_blank_presents(void) { return g_blank_n; }
+#include "dm_blank_link.h"
+static DmBlankLinkRenderer *g_link_blank;
+static _Atomic uint64_t g_blank_n;
+uint64_t front_blank_presents(void) { return g_link_blank?[g_link_blank presentedCount]:atomic_load_explicit(&g_blank_n,memory_order_relaxed); }
 @interface DmBlankView : UIView
 @end
 @implementation DmBlankView { id<MTLCommandQueue> _q; CADisplayLink *_dl; }
@@ -1585,7 +1589,8 @@ uint64_t front_blank_presents(void) { return g_blank_n; }
     if ((self = [super initWithFrame:fr])) {
         CAMetalLayer *l = (CAMetalLayer *)self.layer; l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatBGRA8Unorm; l.contentsScale = UIScreen.mainScreen.nativeScale;
         _q = [l.device newCommandQueue];
-        _dl = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)]; _dl.preferredFrameRateRange = CAFrameRateRangeMake(60, 60, 60);
+        int hz=getenv("DM_BLANK_FPS")?atoi(getenv("DM_BLANK_FPS")):60;if(hz!=30&&hz!=60)hz=60;
+        _dl = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)]; _dl.preferredFrameRateRange = CAFrameRateRangeMake(hz, hz, hz);
         [_dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     }
     return self;
@@ -1597,8 +1602,35 @@ uint64_t front_blank_presents(void) { return g_blank_n; }
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = dr.texture; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(50 / 255.0, 50 / 255.0, 50 / 255.0, 1);
-        id<MTLCommandBuffer> cb = [_q commandBuffer]; [[cb renderCommandEncoderWithDescriptor:rp] endEncoding]; [cb presentDrawable:dr]; [cb commit]; g_blank_n++;
+        id<MTLCommandBuffer> cb = [_q commandBuffer]; [[cb renderCommandEncoderWithDescriptor:rp] endEncoding]; [dr addPresentedHandler:^(id<MTLDrawable> shown){ if(shown.presentedTime>0)atomic_fetch_add_explicit(&g_blank_n,1,memory_order_relaxed); }];
+        [cb presentDrawable:dr]; [cb commit];
     }
 }
 @end
-UIView *front_ios_blank_view(CGRect fr) { return [[DmBlankView alloc] initWithFrame:fr]; }
+@interface DmLinkBlankView : UIView
+- (void)focus:(BOOL)active;
+@end
+static DmLinkBlankView *g_link_blank_view;
+@implementation DmLinkBlankView {CADisplayLink *_hint;UILabel *_status;BOOL _shared;int _fps;}
++ (Class)layerClass{return CAMetalLayer.class;}
+- (instancetype)initWithFrame:(CGRect)fr {
+    if((self=[super initWithFrame:fr])){
+        CAMetalLayer *l=(CAMetalLayer *)self.layer;l.device=MTLCreateSystemDefaultDevice();l.pixelFormat=MTLPixelFormatBGRA8Unorm;l.contentsScale=UIScreen.mainScreen.nativeScale;
+        _fps=getenv("DM_BLANK_FPS")?atoi(getenv("DM_BLANK_FPS")):60;
+        g_link_blank=[[DmBlankLinkRenderer alloc]initWithLayer:l fps:_fps];
+        _status=[[UILabel alloc]initWithFrame:CGRectMake(20,60,fr.size.width-40,120)];_status.numberOfLines=0;_status.textColor=UIColor.whiteColor;_status.text=@"同呈现路径空白对照（不是游戏）\n仅测显示链；不读取资源或存档";[self addSubview:_status];
+        UIButton *b=[UIButton buttonWithType:UIButtonTypeSystem];b.frame=CGRectMake(20,190,260,52);[b setTitle:@"暂停并分享日志" forState:UIControlStateNormal];[b addTarget:self action:@selector(share) forControlEvents:UIControlEventTouchUpInside];[self addSubview:b];
+        // Same secondary main-runloop hint as the game; the actual renderer is CAMetalDisplayLink.
+        _hint=[CADisplayLink displayLinkWithTarget:self selector:@selector(hint:)];_hint.preferredFrameRateRange=CAFrameRateRangeMake(_fps,_fps,_fps);_hint.paused=YES;[_hint addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    }return self;
+}
+- (void)layoutSubviews{[super layoutSubviews];CAMetalLayer *l=(CAMetalLayer *)self.layer;l.drawableSize=CGSizeMake(self.bounds.size.width*l.contentsScale,self.bounds.size.height*l.contentsScale);}
+- (void)hint:(CADisplayLink *)link{static double previous;if(link.timestamp-previous<1)return;previous=link.timestamp;_status.text=[NSString stringWithFormat:@"同路径空白对照：请求 %d FPS\n回调 %llu / 实际呈现 %llu（累计，不是帧率）\n测约一分钟后暂停并分享；切回 normal 后重启游戏",_fps,(unsigned long long)[g_link_blank callbackCount],(unsigned long long)[g_link_blank presentedCount]];}
+- (void)focus:(BOOL)active{if(_shared)active=NO;_hint.paused=!active;[g_link_blank setActive:active];}
+- (void)share{if(_shared)return;_shared=YES;[self focus:NO];dispatch_after(dispatch_time(DISPATCH_TIME_NOW,300*NSEC_PER_MSEC),dispatch_get_main_queue(),^{void dm_sharelog_share(void);dm_sharelog_share();});}
+@end
+void front_ios_blank_focus(int active){[g_link_blank_view focus:active!=0];}
+UIView *front_ios_blank_view(CGRect fr) {
+    if(getenv("DM_BLANK_API")&&!strcmp(getenv("DM_BLANK_API"),"metal")){g_link_blank_view=[[DmLinkBlankView alloc]initWithFrame:fr];return g_link_blank_view;}
+    return [[DmBlankView alloc]initWithFrame:fr];
+}

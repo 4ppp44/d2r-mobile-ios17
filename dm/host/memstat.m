@@ -133,10 +133,10 @@ __attribute__((constructor)) static void memstat_start(void) {
 static void *thrcpu_thread(void *p) {
     char path[1024]; int iv = 10; { const char *c = strchr((const char *)p, ','); snprintf(path, sizeof path, "%.*s", c ? (int)(c - (const char *)p) : (int)strlen(p), (const char *)p); if (c) iv = atoi(c + 1); }
     FILE *f = fopen(path, "w"); if (!f) return NULL;
-    fprintf(f, "秒\t线程号\t线程名\tCPU%%\n"); fflush(f);
-    static uint64_t ids[THR_MAX], last[THR_MAX]; int n = 0; uint64_t t0 = now_ns(), tl = t0;
+    fprintf(f, "秒\t线程号\t线程名\tCPU%%\twall_ns\tcpu_ns\tstate\tuptime_s\n"); fflush(f);
+    static uint64_t ids[THR_MAX], last[THR_MAX], last_tick[THR_MAX]; int n = 0; uint64_t t0 = now_ns(), tl = t0;
     for (;;) {
-        sleep(iv); uint64_t t = now_ns(); double dt = (t - tl) / 1e9, tot = 0; tl = t;
+        sleep(iv); uint64_t t = now_ns(); uint64_t prior_tick=tl, wall = t - tl, total_ns = 0; double tot = 0; tl = t;
         thread_act_array_t th; mach_msg_type_number_t nt = 0;
         if (task_threads(mach_task_self(), &th, &nt) != KERN_SUCCESS) continue;
         for (mach_msg_type_number_t i = 0; i < nt; i++) {
@@ -144,16 +144,23 @@ static void *thrcpu_thread(void *p) {
             thread_identifier_info_data_t ii; mach_msg_type_number_t c2 = THREAD_IDENTIFIER_INFO_COUNT;
             if (thread_info(th[i], THREAD_EXTENDED_INFO, (thread_info_t)&ei, &c1) == KERN_SUCCESS && thread_info(th[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ii, &c2) == KERN_SUCCESS) {
                 uint64_t cpu = ei.pth_user_time + ei.pth_system_time; int k = 0; while (k < n && ids[k] != ii.thread_id) k++;
-                if (k == n && n < THR_MAX) { ids[n] = ii.thread_id; last[n] = cpu; n++; }   // 新线程：本轮只记基线 | New thread: only record the baseline this round
-                else if (k < n) { double pct = (cpu - last[k]) / 1e9 / dt * 100; last[k] = cpu; tot += pct;
-                    if (pct >= 0.5) { char gn[96]; int thr_name_of(pthread_t, char *, size_t); pthread_t pt = pthread_from_mach_thread_np(th[i]);
-                        const char *nm = pt && thr_name_of(pt, gn, sizeof gn) ? gn : ei.pth_name[0] ? ei.pth_name : "-";   // 客体线程：句柄 + 客体名；宿主线程：pthread 名 | Guest thread: handle + guest name; host thread: pthread name
-                        fprintf(f, "%.0f\t%llu\t%s\t%.1f\n", (t - t0) / 1e9, ii.thread_id, nm, pct); } }
+                char gn[96]; int thr_name_of(pthread_t, char *, size_t); pthread_t pt = pthread_from_mach_thread_np(th[i]);
+                const char *nm = pt && thr_name_of(pt, gn, sizeof gn) ? gn : ei.pth_name[0] ? ei.pth_name : "-";
+                // New/retired threads are not silently charged to a complete interval.
+                if (k == n) {
+                    const char *state = n < THR_MAX ? "baseline" : "capacity_untracked";
+                    if (n < THR_MAX) { ids[n] = ii.thread_id; last[n] = cpu; last_tick[n]=t; n++; }
+                    fprintf(f, "%.3f\t%llu\t%s\t-1\t%llu\t-1\t%s\t%.9f\n", (t-t0)/1e9, ii.thread_id, nm, (unsigned long long)wall, state, t/1e9);
+                } else if (cpu >= last[k]) {
+                    uint64_t delta=cpu-last[k], thread_wall=t-last_tick[k];int gap=last_tick[k]!=prior_tick;last[k]=cpu;last_tick[k]=t;
+                    double pct=thread_wall?((double)delta/thread_wall*100):0;if(!gap){total_ns+=delta;tot+=pct;}
+                    fprintf(f, "%.3f\t%llu\t%s\t%.3f\t%llu\t%llu\t%s\t%.9f\n", (t-t0)/1e9, ii.thread_id, nm, pct, (unsigned long long)thread_wall, (unsigned long long)delta,gap?"delta_gap":"delta", t/1e9);
+                } else { last[k]=cpu;last_tick[k]=t; fprintf(f,"%.3f\t%llu\t%s\t-1\t%llu\t-1\tcounter_reset\t%.9f\n",(t-t0)/1e9,ii.thread_id,nm,(unsigned long long)wall,t/1e9); }
             }
             mach_port_deallocate(mach_task_self(), th[i]);
         }
         vm_deallocate(mach_task_self(), (vm_address_t)th, nt * sizeof *th);
-        fprintf(f, "%.0f\t-\t合计\t%.1f\n", (t - t0) / 1e9, tot); fflush(f);
+        fprintf(f, "%.3f\t-\t合计\t%.3f\t%llu\t%llu\ttracked_live_delta_sum\t%.9f\n", (t-t0)/1e9,tot,(unsigned long long)wall,(unsigned long long)total_ns,t/1e9); fflush(f);
     }
     return NULL;
 }

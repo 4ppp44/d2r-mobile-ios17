@@ -1,17 +1,25 @@
-# D2R Mobile: experimental iOS17 / A16 compatibility
+# D2R Mobile: experimental iOS 17 / A16 compatibility
 
-Unofficial game-content-free host adaptation of [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile), based on v1.0.17 (9de307e), including upstream Mac reflection-copy fix1784563. Upstream history, attribution and MIT license are retained. Not an official Blizzard release or upstream promise of iOS17 support.
+Unofficial compatibility fork of [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile), retaining upstream history, attribution and MIT license. The goal is to adapt the upstream M3 path to iOS 17, not reimplement the game or claim official Blizzard/upstream support.
 
-Includes per-encoder legacy resource declarations, bloom/system-UI snapshot protection, direct presentation after GPU Scheduled, and eco60Hz service/two-callback native30FPS policy. No frame generation.
+## Current baseline: 1.0.17 / build 2026101705
 
-Experimental: no claim of stutter-free gameplay, power targets or full-game stability. A roughly one-minute A16/iOS17.0 private build2026101601 log reports later33.36ms intervals but earlyp99windows up to100ms. The fixed25ms dropped-frame threshold mislabels normal30FPS. Long-session thermals/power, physical touch latency and other models/OS versions are not certified. An independent unsigned device-SDK clean build now passes with Xcode and native PNG icon packaging; it is not a new A16 gameplay or power test, and is not claimed byte-identical to the private IPA.
+This update synchronizes cumulative source changes through the locally selected **1705** play baseline, not1706 or unproven experimental patches.
 
-No IPA, game programs/resources, generated game art/shaders, ASTC payloads, keys, saves, private logs or recordings are distributed. Generate private inputs from your own legally obtained game files. Do not upload those files to issues.
+- Retains per-encoder legacy Metal3 resource declarations, bloom/system-UI snapshot protection and direct presentation after GPU Scheduled.
+- Retains the eco30 period correction and presentation-ticket identity. No frame generation; requested60Hz is not guaranteed OS callback delivery.
+- Replaces the secondary input/UI `CADisplayLink` with a main-runloop60Hz `NSTimer`, independent of render30/60. This is not a hard-real-time or physical touch-latency guarantee.
+- Normal play ignores stale diagnostic profiles unless `diagnostics_build.txt` matches the current build. No settings, resources or saves are deleted.
+- Adds opt-in per-thread CPU-time and presentation/pass diagnostics. Normal mode does not activate the extra per-frame/thread/pass collectors.
 
-[Chinese](README.zh-CN.md) | [Build and limitations](docs/IOS17.md) | [Provenance](docs/IOS17_PROVENANCE.md) | [Upstream README](README.upstream.md)
+**Experimental: residual30FPS stutter, latency and heat are not claimed fixed.** Manual1705 play feedback exists for A16/iOS17.0, not full-game certification. Other devices/17.x versions, long-session power, physical touch-to-photon latency and all scenes remain unverified. Host/mock/static checks are not A16 performance; summed GPU command durations are not utilization or whole-device watts.
 
-The helper performs unsigned source builds only, not signing/export/install/device launch. Signing can affect memory entitlement limits; free signing is not claimed equivalent to TrollStore. A new bundleID does not migrate saves/resources.
+## Build and distribution boundaries
 
+**No playable IPA, proprietary game programs/resources, generated game tables/art/shaders, ASTC payloads, keys, saves, private logs or recordings are distributed.** Generate inputs locally from your own legally obtained game files; never upload them to issues.
 
-## Shell build-input prerelease
-A source-matched iOS17 host-only build-input ZIP is distributed through Releases. It is not a playable IPA: users generate game programs and derived resources locally from their own game files with `dm/tools/d2rm_pack.py`. No game payload is distributed. See [instructions](docs/NO_XCODE.md). New guest-dylib output minimum is17.0, not upstream26.0.
+[Chinese](README.zh-CN.md) | [Build/limitations](docs/IOS17.md) | [Changelog](CHANGELOG.md) | [Provenance](docs/IOS17_PROVENANCE.md) | [Upstream README](README.upstream.md)
+
+The existing **preview.1** host build-input release remains tied to its original source commit; **it is not a1705 update**. This commit publishes source/docs only, does not replace existing release assets, and does not upload the private1705 IPA. Rebuild the1705 host and your private inputs according to the build notes.
+
+Helpers do not install/launch a phone, change settings or migrate saves. Different bundle IDs use separate containers; signing/memory entitlements are not equivalent across installation methods. Keep private inputs/caches/IPAs outside the source tree and avoid multiple large staging copies.

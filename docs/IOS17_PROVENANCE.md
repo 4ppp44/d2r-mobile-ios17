@@ -10,3 +10,9 @@
 - Final exact-path privacy/source-hash verification is required before publication. No private artifacts may be committed.
 
 - Shell preview follows upstream DM_SHELL/stubs/derived-manifest separation. iOS17 shell builder uses native PNG icons, direct deviceSDK target selection and debug/source-path stripping; guest framework writer minOS/plist both17.0. Shell game-content audit and local source-matched reconstruction are separate from earlier embedded1601 device observations; see Release for exact passed gates and untested scope. No full game IPA is a public asset.
+
+## 2026-10-17 source synchronization:1705 baseline
+
+Runtime source is synchronized to the privately retained1.0.17/build2026101705 baseline, with public build/guest-minOS17/PNG-wrapper fixes retained. No full latest-main merge is implied. Generated c1 runtime captures, skill/item/experience tables, Gen trees and private artifacts are excluded. The1706 timeout recheck and rejected MRU2 prototype are not included.
+
+The core NVN source SHA256 is `650d3499c13cf7961cbe78396f34cf036188e2b5d4060c13717f4bfde9a3106b`. The source-only package is not claimed byte-identical to a private IPA: public toolchain/build wrappers, regenerated assets and signing differ. New checks are compile/native contracts, not A16 power or end-to-end latency acceptance. Residual30FPS stutter and heat remain.

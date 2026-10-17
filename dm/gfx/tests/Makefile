@@ -85,3 +85,6 @@ run: t_nvn t_dirty_slots t_builtin t_deswz_gpu t_pace t_refl t_hmap t_cover t_fu
 	MTL_DEBUG_LAYER=1 ./t_rt_srgb_view
 	python3 test_tbdr_budget.py
 .PHONY: run
+
+t_copy_pitch: t_copy_pitch.c ../nvn/nvn_copy_pitch.h
+	clang -O1 -Wall -Werror -o $@ t_copy_pitch.c

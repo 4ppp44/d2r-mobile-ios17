@@ -27,11 +27,14 @@ void dm_host_shutdown(const char *why);   // 宿主优雅退出（dm/host/hle_li
 #include "front.h"                        // front_game_res（全屏输出分辨率） | front_game_res (full-screen output resolution)
 #include "../../host/romfs_validate.h"
 #include "../../host/dm_i18n.h"
+#include "dm_measurement.h"
 static NSString *T(const char *k) { return @(dm_ui(k)); }   // 我们自己的界面文字（中英表 dm/i18n/ui_text.tsv，语言跟原版设置走） | our own UI text (Chinese-English string table dm/i18n/ui_text.tsv, language follows the original game's setting)
 #import <Network/Network.h>
 #include "dm_metal_cache_guard.h"
 
 static NSString *g_mode;
+static NSString *g_measurement_profile;static BOOL g_measurement_started;
+
 static int g_log = -1;
 static int g_log_tee;
 static int g_log_stderr = -1;
@@ -1110,10 +1113,21 @@ static void astc_handoff(UIWindow *w) {   // 补充包到位（玩家刚拷好 /
     g_T[4] = since_start();
     plog("启动计时 T4 willConnect 末 %.1f ms", g_T[4]);
 }
-- (void)sceneWillResignActive:(UIScene *)s { if (g_host_up) front_ios_focus_event(0); }
-- (void)sceneDidEnterBackground:(UIScene *)s { if (g_host_up) front_ios_focus_event(1); }
-- (void)sceneWillEnterForeground:(UIScene *)s { log_promote(); if ([g_mode isEqualToString:@"boot"] && !g_need_assets && !g_no_bc && !g_block_title) { host_start(); if (g_host_up) front_ios_focus_event(2); } }
-- (void)sceneDidBecomeActive:(UIScene *)s { if (g_host_up) front_ios_focus_event(3); }
+- (void)sceneWillResignActive:(UIScene *)s { void front_ios_blank_focus(int);front_ios_blank_focus(0); if (g_host_up) front_ios_focus_event(0); }
+- (void)sceneDidEnterBackground:(UIScene *)s { void front_ios_blank_focus(int);front_ios_blank_focus(0); if (g_host_up) front_ios_focus_event(1); }
+- (void)sceneWillEnterForeground:(UIScene *)s { log_promote();
+#if defined(DM_LEGACY_IOS17)
+    // Do not rotate a previous measurement during prewarming/background relaunch.
+    if(!g_measurement_started && ([g_mode isEqualToString:@"boot"]||[g_mode isEqualToString:@"blank"])) {
+        g_measurement_started=YES;NSString *doc=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES)[0];
+        NSDictionary *m=dm_measurement_prepare(doc,g_measurement_profile?:@"normal",[NSBundle.mainBundle.infoDictionary[@"CFBundleVersion"] description],g_mode);
+        plog("measurement session=%s profile=%s mode=%s instrumented=%d manifest_written=%d",[m[@"session"] UTF8String],[m[@"profile"] UTF8String],g_mode.UTF8String,[m[@"instrumented"] boolValue],[m[@"manifest_written"] boolValue]);
+        void dm_thrcpu_start_if_requested(void);dm_thrcpu_start_if_requested();
+        if([g_mode isEqualToString:@"blank"]){uint64_t front_blank_presents(void);void front_ios_heat_start(uint64_t(*)(void),int);front_ios_heat_start(front_blank_presents,0);}
+    }
+#endif
+ if ([g_mode isEqualToString:@"boot"] && !g_need_assets && !g_no_bc && !g_block_title) { host_start(); if (g_host_up) front_ios_focus_event(2); } }
+- (void)sceneDidBecomeActive:(UIScene *)s { void front_ios_blank_focus(int);front_ios_blank_focus(1); if (g_host_up) front_ios_focus_event(3); }
 // 场景断开 / App 终止：宿主有序收尾后 _exit（hle_lifecycle.c）。注意：用户在多任务界面划掉一个已在后台挂起的 App 时，系统直接 SIGKILL，不走这两个回调
 // Scene disconnect / App termination: the host shuts down in order, then _exit (hle_lifecycle.c). Note: when the user swipes away an App already suspended in the background from the multitasking screen, the system sends SIGKILL directly and neither of these two callbacks runs
 - (void)sceneDidDisconnect:(UIScene *)s { if (g_host_up) dm_host_shutdown("iOS 场景断开"); }
@@ -1153,7 +1167,7 @@ static void bg_relaunch_test(void) {
     g_T[3] = since_start();
     if ([g_mode isEqualToString:@"blank"]) {   // 发热负对照：不锁屏，按 DM_HEAT 采样 | Heat negative control: do not lock the screen, sample per DM_HEAT
         UIApplication.sharedApplication.idleTimerDisabled = YES;
-        uint64_t front_blank_presents(void); void front_ios_heat_start(uint64_t (*)(void), int); front_ios_heat_start(front_blank_presents, 0);
+        // Measurement sampling starts on the first actual foreground scene, not app prewarming.
     }
     const char *us = getenv("DM_TEST_UISHOT");   // 只测试用：DM_TEST_UISHOT=<秒>:<名字>，到点把当前窗口存成 Documents/<名字>.png——资源界面、着色器准备页这类系统界面层，游戏内截图截不到 | Test only: DM_TEST_UISHOT=<seconds>:<name> saves the current window to Documents/<name>.png at that time -- UIKit-level screens such as the resource screen and the shader preparation page cannot be captured by the in-game screenshot
     if (us && atof(us) > 0 && strchr(us, ':')) { NSString *fn = @(strchr(us, ':') + 1); dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(us) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1197,6 +1211,15 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+#if defined(DM_LEGACY_IOS17)
+    NSString *measurementProfile=dm_measurement_requested_profile(doc,[NSBundle.mainBundle.infoDictionary[@"CFBundleVersion"] description]);
+    // A manually imported blank profile is an explicit next-launch request only.
+    BOOL explicitMode=NO;for(int j=1;j+1<argc;j++)if(!strcmp(argv[j],"-mode"))explicitMode=YES;
+    if(!explicitMode && [g_mode isEqualToString:@"boot"] && dm_measurement_is_blank(measurementProfile))g_mode=@"blank";
+    if([g_mode isEqualToString:@"blank"] && !dm_measurement_is_blank(measurementProfile))measurementProfile=@"blank60";
+    g_measurement_profile=measurementProfile;
+    if([g_mode isEqualToString:@"blank"])dm_measurement_boot_env(measurementProfile);
+#endif
     const char *log_file = strdup([doc stringByAppendingPathComponent:[g_mode stringByAppendingString:@".txt"]].fileSystemRepresentation);
     // boot 模式先写 boot.launch.txt：进程可能是系统在没人操作时拉起来的（应用预热只跑到这个函数末尾的 UIApplicationMain 之前；后台下载事件会一路跑到
     // didFinishLaunching），那种启动不该动玩家上一局的日志。场景第一次到前台时才把上一局的 boot.txt 留成 boot.previous.txt、把本轮日志改名成 boot.txt（log_promote）。
@@ -1219,15 +1242,7 @@ int main(int argc, char *argv[]) {
         BOOL lineSync = [logSync isEqualToString:@"baseline"];
         setenv("DM_IOS17_LOG_BATCH",lineSync?"0":"1",0);
         plog("boot: iOS17 日志同步档 %s（按管道read同步；不丢日志、不降低画质）",getenv("DM_IOS17_LOG_BATCH")[0]=='0'?"baseline-line":"optimized-read-batch");
-        NSString *diagnostics = [[NSString stringWithContentsOfFile:[doc stringByAppendingPathComponent:@"diagnostics_profile.txt"] encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        BOOL gpuDiagnostics = [diagnostics isEqualToString:@"gpu"];
-        if ([diagnostics isEqualToString:@"detailed"] || gpuDiagnostics) {
-            setenv("DM_THRCPU","ios17_threads.tsv,10",0);
-            setenv("DM_NVN_TSV","ios17_frames.tsv",0);
-            if (gpuDiagnostics) { setenv("DM_NVN_PASSGPU","ios17_pass_gpu.tsv",0); plog("boot: iOS17 逐通道GPU诊断 开（仅归因用，会增加采样开销；不用于性能验收）"); }
-            void dm_thrcpu_start_if_requested(void); dm_thrcpu_start_if_requested();
-            plog("boot: iOS17 详细诊断 开（线程CPU/10秒、逐帧TSV；不使用新存档、不自动退出）");
-        }
+        plog("boot: iOS17 测量档 %s（normal不额外采样；timing逐帧+线程CPU；gpu含逐通道计时，不能当性能成绩）",measurementProfile.UTF8String);
         NSString *upload = [[NSString stringWithContentsOfFile:[doc stringByAppendingPathComponent:@"upload_profile.txt"] encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         BOOL oldUpload=[upload isEqualToString:@"baseline"];
         setenv("DM_IOS17_UPLOAD_WAIT",oldUpload?"1":"0",0);

@@ -18,6 +18,7 @@
 #include <pwd.h>
 #include <unistd.h>
 #include "../../host/dm_i18n.h"
+#include "dm_measurement.h"
 void plog(const char *fmt, ...);
 void dm_sharelog_init(void (*cb)(void));   // dm/host/diag.c
 
@@ -52,7 +53,11 @@ static NSURL *build_file(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
     NSData *(^rd)(NSString *) = ^NSData *(NSString *n) { return [NSData dataWithContentsOfFile:[doc stringByAppendingPathComponent:n] options:NSDataReadingMappedIfSafe error:nil]; };   // 映射着读：日志没有字节封顶，整读进内存再拼、再洗各拷一遍，峰值是日志的四倍 | read through a mapping: the log has no byte cap, and reading it whole into memory, then joining and scrubbing with one copy each, peaks at four times the log size
-    NSData *cur = rd(@"boot.txt"), *prev = rd(@"boot.previous.txt");
+    NSData *manifest=dm_measurement_manifest(doc);
+    NSDictionary *measurement=manifest.length<65536 && manifest.length ? [NSJSONSerialization JSONObjectWithData:manifest options:0 error:nil] : nil;
+    if(![measurement isKindOfClass:NSDictionary.class])measurement=nil;
+    BOOL blank=[measurement[@"mode"] isEqual:@"blank"];
+    NSData *cur = rd(blank?@"blank.txt":@"boot.txt"), *prev = blank?nil:rd(@"boot.previous.txt");
     NSDictionary *inf = NSBundle.mainBundle.infoDictionary; NSString *build = [inf[@"CFBundleVersion"] description] ?: @"未知";
     NSDateFormatter *df = [NSDateFormatter new]; df.dateFormat = @"yyyy-MM-dd HH:mm:ss ZZZ";
     char hw[64] = "未知"; size_t hn = sizeof hw; sysctlbyname("hw.machine", hw, &hn, NULL, 0);
@@ -69,7 +74,14 @@ static NSURL *build_file(void) {
     void (^part)(NSString *, NSData *) = ^(NSString *t, NSData *d) {
         [out appendData:[[NSString stringWithFormat:@"\n\n===== %@（%@）=====\n", t, d ? [NSString stringWithFormat:@"%lu 字节", (unsigned long)d.length] : @"没有这份日志"] dataUsingEncoding:NSUTF8StringEncoding]];
         if (d) [out appendData:d]; };
-    part(@"本局日志 boot.txt", cur); part(@"上一局日志 boot.previous.txt", prev);
+    part(blank?@"本局日志 blank.txt":@"本局日志 boot.txt", cur); part(@"上一局日志 boot.previous.txt", prev);
+    part(@"测量会话 measurement_current.json",manifest);
+    for(NSDictionary *item in dm_measurement_snapshot(doc,8*1024*1024)) {
+        NSMutableDictionary *meta=[item mutableCopy];NSData *data=meta[@"data"];[meta removeObjectForKey:@"data"];
+        NSData *md=[NSJSONSerialization dataWithJSONObject:meta options:NSJSONWritingSortedKeys error:nil];
+        part([NSString stringWithFormat:@"测量元数据 %@",item[@"role"]],md);
+        if(data)part([NSString stringWithFormat:@"测量数据 %@",item[@"role"]],data);
+    }
     NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"sharelog"];   // 只放这一份导出：每次重建这个目录（我们自己的，不碰别的） | Hold only this one export: rebuild this directory every time (it is our own; nothing else is touched)
     [fm removeItemAtPath:dir error:nil]; [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     df.dateFormat = @"yyyyMMdd_HHmmss";

@@ -30,6 +30,7 @@
 #include <mach/mach.h>
 #include <TargetConditionals.h>
 #include <unistd.h>
+#include <math.h>
 #if TARGET_OS_OSX
 #define DM_MEM_CAP_DEFAULT_GB 24
 #else
@@ -726,6 +727,7 @@ NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNte
     copy_view(&o->sv, &o->has_sv, sv); copy_view(&o->dv, &o->has_dv, dv); o->sr = *sr; o->dr = *dr; o->flags = flags;
 }
 NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_STRIDE, p_copy_stride)->stride = st; }
+NVN(nvnCommandBufferSetCopyImageStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_IMAGE_STRIDE, p_copy_stride)->stride = st; }
 NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
 
 // ---------- 状态对象：就地打包（nvn_obj.h） ----------
@@ -914,6 +916,20 @@ static uint64_t x_present_ticket(uint64_t job) {   // 出图任务执行完后�
     if (lost) { static int red; if (!red++) LOG("【红】翻译队列：出图任务 %llu 的票号已被覆盖（票号表 %d 项不够），这次取图不等出图线程", (unsigned long long)job, XTK); }
     return tk;
 }
+// Window request ordinals are not backend tickets: gated requests issue no ticket,
+// and all windows share the backend stream. Resolve delayed requests through their
+// translation jobs WITHOUT waiting for the worker (unknown/overwritten -> no reading).
+static void x_present_samples(const win_t *o, uint64_t n, double *a, double *b) {
+    uint64_t jobs[2] = {o->present_jobs[n % 16], o->present_jobs[(n - 1) % 16]}, tickets[2] = {0, 0};
+    pthread_mutex_lock(&g_xmu);
+    for (unsigned i = 0; i < 2; i++) {
+        uint64_t job = jobs[i];
+        if (job && job <= g_xq_done && g_xtk[job % XTK].job == job) tickets[i] = g_xtk[job % XTK].tk;
+    }
+    pthread_mutex_unlock(&g_xmu);
+    *a = tickets[0] ? mtl_presented_time(tickets[0]) : 0;
+    *b = tickets[1] ? mtl_presented_time(tickets[1]) : 0;
+}
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     gfx_enter();
     ((queue_t *)q)->submits++;
@@ -1002,6 +1018,7 @@ NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
 static void trow(uint64_t f, const char *name, double v);
 static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
+static uint64_t present_link_timeout(const win_t *o);
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
 extern uint32_t mtl_present_qos(void);
@@ -1020,7 +1037,14 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         static uint64_t rt_period; uint64_t period = present_period(o);
         if (period && rt_period != period) { rt_period = period; set_time_constraint(&g_rt_main, period); }
         rt_comp_tick(&g_rt_main, period);
-        if (mtl_link_active()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
+        if (mtl_link_active()) {
+            static uint64_t calls, timeouts, total_ns, max_ns, sample_period;
+            if (sample_period != period) { sample_period = period; calls = timeouts = total_ns = max_ns = 0; }
+            uint64_t begin = now_ns(); int ok = mtl_link_wait_tick(present_link_timeout(o));
+            uint64_t elapsed = now_ns() - begin; calls++; timeouts += !ok; total_ns += elapsed; if (elapsed > max_ns) max_ns = elapsed;
+            if (calls % 300 == 0) { LOG("[nvn] iOS17 pace_contract frame=%llu render_ms=%.3f callback_timeout_ms=%.3f calls=300 timeouts=%llu wait_mean_ms=%.3f wait_max_ms=%.3f", (unsigned long long)g_frame, period / 1e6, present_link_timeout(o) / 1e6, (unsigned long long)timeouts, total_ns / 300e6, max_ns / 1e6); timeouts = total_ns = max_ns = 0; }
+            if (!ok && wait) sleep_until_ns(at);
+        }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // 机器满载时帧只会更慢、后台得到的墙钟只会更多，所以「消息后第 N 帧」截到的画面与负载无关
@@ -1179,9 +1203,14 @@ static double srow(uint64_t f, const char *name, double dflt) {
 // Dropped-frame definition: on-screen present interval > 16.7×1.5 ms or −1; without a window (no on-screen present time) fall back to the present call interval
 static void slow_emit(uint64_t f) {
     static uint64_t judged, slow;
-    double pm = srow(f, "@presented_ms", 0), fr = srow(f, "@frame_ms", 0), lim = 1000.0 / 60 * 1.5;
-    int has = mtl_has_window(), bad = has ? (pm > lim || pm < 0) : fr > lim;
-    if (has ? pm != 0 : fr != 0) judged++;
+    double pm = srow(f, "@presented_ms", 0), fr = srow(f, "@frame_ms", 0);
+    // Budget is latched on this frame, never inferred from the observed slow interval.
+    double target = srow(f, "@target_frame_ms", 0), lim = target * 1.5;
+    int has = mtl_has_window();
+    int known = target > 0 && isfinite(target) && srow(f, "@target_changed", 0) <= 0;
+    int bad = has ? (pm < 0 || (known && pm > lim)) : known && fr > lim;
+    if ((has ? pm != 0 : fr != 0) && (known || (has && pm < 0))) judged++;
+    trow(f, "@slow_budget_ms", known ? lim : -1);
     if (bad) {
         slow++;
         char b[4096]; size_t o = snprintf(b, sizeof b, "[slowframe]\t%llu", f);
@@ -1212,7 +1241,14 @@ static void set_time_constraint_comp(rt_decl *d, uint64_t period_ns, uint64_t co
     LOG("[nvn] %s时间约束策略（周期 %.3f ms、计算 %.3f ms）%s", d->who, period_ns / 1e6, comp_ns / 1e6, kr == KERN_SUCCESS ? "已设" : "设置失败");
 }
 static int rt_comp_fixed_ms(void) { static int v = -2; if (v == -2) { const char *e = getenv("DM_RT_COMP"); v = e && *e && strcmp(e, "auto") ? atoi(e) : -1; } return v; }   // −1 = auto
-static void set_time_constraint(rt_decl *d, uint64_t period_ns) { int f = rt_comp_fixed_ms(); set_time_constraint_comp(d, period_ns, f > 0 ? (uint64_t)f * 1000000ull : 2000000ull); }   // 首次：固定值，或 auto 的起始值 2 ms | first time: the fixed value, or auto's starting value of 2 ms
+static void set_time_constraint(rt_decl *d, uint64_t period_ns) {
+    int f = rt_comp_fixed_ms();
+    // A30/60 switch changes the deadline, not the learned amount of CPU work.
+    // Retain the estimate (clamped by setter), discard the mixed-period sample window.
+    uint64_t comp = f > 0 ? (uint64_t)f * 1000000ull : d->comp_ms > 0 ? (uint64_t)(d->comp_ms * 1e6) : 2000000ull;
+    if (d->period_ms != period_ns / 1e6) { d->last = 0; d->n = 0; }
+    set_time_constraint_comp(d, period_ns, comp);
+}   // 首次：固定值，或 auto 的起始值 2 ms | first time: the fixed value, or auto's starting value of 2 ms
 // 每帧在取图处调：记本线程自上次以来的 CPU 时间；auto 模式下按 p90 重新声明
 // Called every frame at acquire: records this thread's CPU time since the last call; in auto mode re-declares based on p90
 static void rt_comp_tick(rt_decl *d, uint64_t period_ns) {   // 在被声明的那条线程上调（读本线程 CPU 时钟） | Call on the thread being declared (reads this thread's CPU clock)
@@ -1262,12 +1298,19 @@ static void present_cfg(const win_t *o) {
 }
 static uint64_t present_period(const win_t *o) {
     present_cfg(o);
-    int itv = g_display_mode ? 1 : o->interval > 0 ? o->interval : 1; double hz = g_hz_auto ? dm_pace_hz(mtl_display_refresh(), 60) : g_hz;   // 省电模式的 30 帧由显示节拍决定，这里照旧按 60 档（60 / 120 Hz 屏与原先逐字相同） | Power saving 30 fps is determined by display pacing; here the 60 tier is used as before (identical to before on 60 / 120 Hz screens)
+    int itv = g_display_mode ? 1 : o->interval > 0 ? o->interval : 1; double hz = g_hz_auto ? mtl_pace_hz() : g_hz;   // 30帧的线程声明、交换链后备周期与真实生产目标一致；60帧不变 | Match RT/swapchain period to actual eco target; keep 60fps unchanged
     return hz > 0 ? (uint64_t)(itv * 1e9 / hz) : 0;
+}
+// Drawable service is still60Hz in eco. Do not double the old callback timeout
+// merely because the render/RT period is now correctly33.33ms.
+static uint64_t present_link_timeout(const win_t *o) {
+    uint64_t period = present_period(o);
+    double service = g_hz_auto ? dm_pace_hz(mtl_display_refresh(), 60) : 0;
+    return service > 0 ? (uint64_t)(2e9 / service) : period ? 2 * period : 33333333ull;
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
-    (void)q; win_t *o = (win_t *)w; o->presents++;
+    (void)q; win_t *o = (win_t *)w; o->presents++; o->present_jobs[o->presents % 16] = 0;
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     // 第一次进局的读取画面：后台管线预热没跑完就在这里等它（读取画面多停一会儿），进局后不在提交线程现编管线。预热早已完成时一次判断即过
     // Loading screen on first entering a run: if the background pipeline warm-up has not finished, wait for it here (the loading screen stays a bit longer), so that after entering the run no pipelines are compiled on the fly on the submit thread. When warm-up finished long ago this passes with a single check
@@ -1278,7 +1321,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     uint64_t t0 = now_ns();
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // 只入队，立即返回；ticket 存翻译队列的任务号 | Enqueue only and return at once; ticket holds the translation queue's job number
         xjob j = {XJ_PRESENT, 0, NULL, snap_tex(o->tex[idx]), present_period(o) / 1e9}; memcpy(j.crop, o->crop, sizeof j.crop);
-        o->ticket[idx] = x_push(&j); }
+        o->ticket[idx] = x_push(&j); o->present_jobs[o->presents % 16] = o->ticket[idx]; }
     gfx_leave();
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
@@ -1301,6 +1344,15 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         double fr = (t0 - prev_in) / 1e6, wk = (t0 - prev_out) / 1e6, nv = atomic_exchange(&g_nvn_ns, 0) / 1e6;
         tpush(0, fr); tpush(1, wk); tpush(2, nv);
         trow(f, "@frame_ms", fr); trow(f, "@work_ms", wk); trow(f, "@nvn_ms", nv);
+        if (frame_rec()) {
+            static uint64_t last_target_ns;
+            uint64_t target_ns = present_period(o);
+            trow(f, "@target_frame_ms", target_ns / 1e6);
+            trow(f, "@target_changed", last_target_ns && last_target_ns != target_ns ? 1 : 0);
+            last_target_ns = target_ns;
+            trow(f, "@has_drawable_layer", mtl_has_window() ? 1 : 0);
+            trow(f, "@clock_is_deterministic", getenv("DM_DETCLOCK") ? 1 : 0);
+        }
         // 慢帧归因（只在开 DM_NVN_TSV 时取）：本帧出图线程 CPU 时间（换线程记 −1）、进程全部线程 CPU、取图等待按帧累计、出图调用时刻（与 GPU / 上屏时刻同基：进程起点 ms）
         // Slow-frame attribution (taken only when DM_NVN_TSV is on): this frame's present-thread CPU time (−1 if the thread changed), CPU of all threads in the process, acquire wait accumulated per frame, present call time (same base as the GPU / on-screen present times: ms since process start)
         tpush(6, g_acq_wait_ns / 1e6); tpush(7, g_pq_wait_ns / 1e6);
@@ -1378,7 +1430,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     static uint64_t prev_slot; if (prev_slot && period) trow(f, "@display_ms", (slot - prev_slot) / 1e6); prev_slot = slot;   // 屏幕上相邻两帧的显示间隔（掉帧看这个） | display interval between two adjacent frames on screen (this is the one to look at for dropped frames)
     // 实际呈现间隔（窗口模式）：滞后 8 次出图取（呈现回调已到），第 n 次与第 n−1 次之差；−1 = 被丢弃
     // Actual presentation interval (windowed mode): taken 8 presents late (the presented callback has arrived by then), as the difference between the n-th and the (n−1)-th; −1 = discarded
-    if (o->presents > 9) { uint64_t n = o->presents - 8; double a_ = mtl_presented_time(n), b_ = mtl_presented_time(n - 1);
+    if (o->presents > 9) { uint64_t n = o->presents - 8; double a_, b_; x_present_samples(o, n, &a_, &b_);
         if (a_ < 0) trow(f - 8, "@presented_ms", -1); else if (a_ > 0 && b_ > 0) trow(f - 8, "@presented_ms", (a_ - b_) * 1e3);
         g_pres_iv[g_presn++ % TWIN] = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0);
         { double iv_ = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0); mtl_ub_present(iv_); }   // 同进程交替测量（DM_NVN_UB）按相统计上屏间隔；没开时只是一次原子读 | same-process alternating measurement (DM_NVN_UB) tallies on-screen present intervals per phase; when off it is just one atomic read

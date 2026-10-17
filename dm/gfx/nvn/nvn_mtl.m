@@ -1,3 +1,6 @@
+#include "dm_present_schedule.h"
+#include "dm_display_trace.h"
+static _Thread_local dm_display_context g_display_context;
 // NVN 空设备的 Metal 执行层，见 nvn_mtl.h。
 // Metal execution layer of the NVN null device, see nvn_mtl.h.
 #import <Metal/Metal.h>
@@ -14,6 +17,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include "nvn_mtl.h"
+#include "nvn_copy_pitch.h"
 // 编译期开关 DM_NVN_M3=1：图形后端走老接口（普通命令队列 / 命令缓冲 / 渲染与计算与拷贝编码器，逐槽绑定缓冲，对参数块引用的资源逐个声明），
 // 目标 macOS 15 / iOS 18。缺省 0 = Metal 4（macOS 26 / iOS 26）。两支共用同一份回放逻辑，分叉处都在 #if DM_NVN_M3 里
 // Compile-time switch DM_NVN_M3=1: the graphics backend uses the older API (ordinary command queue / command buffers / render, compute and copy encoders, buffers bound per slot, each resource referenced by an argument block declared individually),
@@ -649,6 +653,16 @@ static inline void m4_end(id e) { [e endEncoding]; }   // 老接口没有显式�
 #include "nvn_m3_bind_cache.h"
 static dm_m3_bind_cache g_m3_binding_cache;
 static _Atomic uint64_t g_m3_bind_native, g_m3_bind_skipped, g_m3_bind_offset;
+// One writer: the replay/submit thread. No GPU decisions depend on these counters.
+// Publish cumulative snapshots at submit boundaries for the presentation-thread logger.
+// Avoid a cross-thread-visible atomic RMW for every binding, including cache hits.
+static uint64_t g_m3_bind_local_native, g_m3_bind_local_skipped, g_m3_bind_local_offset;
+static inline void m3_bind_stats_publish(void) {
+    atomic_store_explicit(&g_m3_bind_native, g_m3_bind_local_native, memory_order_relaxed);
+    atomic_store_explicit(&g_m3_bind_skipped, g_m3_bind_local_skipped, memory_order_relaxed);
+    atomic_store_explicit(&g_m3_bind_offset, g_m3_bind_local_offset, memory_order_relaxed);
+}
+
 // Submit-thread only. The native encoder retains a bound buffer; valid bits are
 // reset on every encoder and nil bindings never use the offset-only API.
 static __unsafe_unretained id<MTLBuffer> g_m3_bound_buf[2][DM_M3_BIND_SLOTS];
@@ -660,16 +674,16 @@ static int m3_binding_cache_on(void) {
 }
 static inline void m3_rbuf(id<MTLRenderCommandEncoder> e, int vertex, NSUInteger i, uint64_t gpu) {
     int cached = m3_binding_cache_on() && i < DM_M3_BIND_SLOTS;
-    if (cached && dm_m3_bind_seen(&g_m3_binding_cache,vertex,(unsigned)i,gpu)) { atomic_fetch_add_explicit(&g_m3_bind_skipped,1,memory_order_relaxed); return; }
+    if (cached && dm_m3_bind_seen(&g_m3_binding_cache,vertex,(unsigned)i,gpu)) { ++g_m3_bind_local_skipped; return; }
     NSUInteger off; id<MTLBuffer> b = m3_buf(gpu, &off); if (gpu && !b) { { static int n_; if (!n_++) MLOG("【红】老接口绑定：显卡地址 %#llx 不在任何登记过的缓冲里（槽 %lu）", (unsigned long long)gpu, (unsigned long)i); } return; }
     unsigned stage = vertex ? 0 : 1;
     if (cached && b && (g_m3_binding_cache.valid[stage] & (UINT32_C(1) << i)) && g_m3_bound_buf[stage][i] == b && m3_offset_cache_on()) {
         if (vertex) [e setVertexBufferOffset:off atIndex:i]; else [e setFragmentBufferOffset:off atIndex:i];
-        atomic_fetch_add_explicit(&g_m3_bind_offset,1,memory_order_relaxed);
+        ++g_m3_bind_local_offset;
     } else {
         if (vertex) [e setVertexBuffer:b offset:off atIndex:i]; else [e setFragmentBuffer:b offset:off atIndex:i];
     }
-    atomic_fetch_add_explicit(&g_m3_bind_native,1,memory_order_relaxed);
+    ++g_m3_bind_local_native;
     if (cached) { dm_m3_bind_record(&g_m3_binding_cache,vertex,(unsigned)i,gpu); g_m3_bound_buf[stage][i] = b; }
 }
 #else
@@ -889,6 +903,9 @@ static const char *cctx_snap(void);   // 这次提交里有什么（出错时打
 uint64_t mtl_sub_commit(void) {
     defer_fallback();   // 推迟合并通道：提交结束仍有未回放的 P 绘制（正常路径不会到这里） | Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
     rp_flush();
+#if DM_NVN_M3
+    m3_bind_stats_publish();
+#endif
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     up_flush();
     uint64_t fence = ++g_fence;
@@ -2644,7 +2661,7 @@ static struct {
     uint64_t tex[6][128], samp[6][128], img[6][32];
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp;
-    float blend_color[4]; int64_t copy_stride;
+    float blend_color[4]; int64_t copy_stride, copy_image_stride;
 } S;
 static void udc_note_draw(NvProg *pr) {
     // 同一目标、全零集合代号没变：上次已把它删掉，不必再扫一遍集合（集合最长 4096 项，每次绘制每个颜色附件扫一次）
@@ -3475,6 +3492,7 @@ static int state_op(uint32_t op, const void *a) {
         case OP_DEPTH_RANGE: { const p_depth_range *b = a; S.dr[0] = b->n; S.dr[1] = b->f; break; }
         case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
         case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
+        case OP_COPY_IMAGE_STRIDE: S.copy_image_stride = ((const p_copy_stride *)a)->stride; break;
         default: return 0;
     }
     return 1;
@@ -5068,11 +5086,14 @@ static void copy_t2b(const p_copy_b2t *c) {
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
-    size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
-    size_t rows = (c->r.height + bh - 1) / bh, img = row * rows;
+    size_t row, img, extent;
+    if (!nvn_copy_pitch(c->r.width, c->r.height, c->r.depth, bw, bh, bpb,
+                        S.copy_stride, S.copy_image_stride, &row, &img, &extent)) {
+        MLOG("Invalid texture copy pitch"); return;
+    }
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
     void *mb; uint64_t mo;
-    if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(31, "贴图→缓冲拷贝的目标不在内存池里"); return; }
+    if (!mtl_addr(c->src, extent, &mb, &mo)) { RED_ONCE(31, "贴图→缓冲拷贝的目标不在内存池里"); return; }
     BENC b = blit();
     if (is3d)
         enc_b_copy_texture_buffer(b, t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset), MTLSizeMake(c->r.width, c->r.height, nz), (__bridge id<MTLBuffer>)mb, mo, row, img);
@@ -5120,11 +5141,14 @@ static void copy_b2t(const p_copy_b2t *c) {
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
-    size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
-    size_t rows = (c->r.height + bh - 1) / bh, img = row * rows;
+    size_t row, img, extent;
+    if (!nvn_copy_pitch(c->r.width, c->r.height, c->r.depth, bw, bh, bpb,
+                        S.copy_stride, S.copy_image_stride, &row, &img, &extent)) {
+        MLOG("Invalid texture copy pitch"); return;
+    }
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
     void *mb; uint64_t mo;
-    if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(23, "缓冲→贴图拷贝的源不在内存池里"); return; }
+    if (!mtl_addr(c->src, extent, &mb, &mo)) { RED_ONCE(23, "缓冲→贴图拷贝的源不在内存池里"); return; }
     uint32_t upf; int ubpp;
     if (bc_unpack(c->tex->d.format, &upf, &ubpp)) {   // 无 BC：源里的压缩块在 CPU 上解压进临时缓冲，再按像素拷进解压格式的贴图 | No BC: the compressed blocks in the source are decompressed on the CPU into a temporary buffer, then copied pixel-wise into the decompressed-format texture
         const uint8_t *src = [(__bridge id<MTLBuffer>)mb contents];
@@ -5580,7 +5604,7 @@ void mtl_exec(const uint8_t *p) {
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
             case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
-            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
+            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BLEND_COLOR: case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE:
                 state_op(h.op, a); break;
             case OP_COPY_B2T: copy_b2t(a); break;
             case OP_COPY_T2B: copy_t2b(a); break;
@@ -6004,7 +6028,17 @@ static int present_encode_m4(CBUF cb, id<MTLTexture> src, id<MTLTexture> dst, co
 }
 static double g_link_it_tin;   // 节拍回调正在上屏的那一帧的入队时刻（只在节拍线程读写） | Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
 static int present_now_impl(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
-    const int profile_sample = ticket % 300 == 0;
+    const int display_trace=dm_display_trace_enabled();
+    dm_display_context dx=g_display_context;dx.ticket=ticket;dx.frame=frame;
+    // Opt-in diagnostic cadence only; production keeps the established 300-ticket sample.
+    static unsigned stage_every;
+    unsigned every=__atomic_load_n(&stage_every,__ATOMIC_ACQUIRE);
+    if (!every) { const char *e=getenv("DM_PRESENT_STAGE_EVERY"); long n=e?strtol(e,NULL,10):300; every=(unsigned)(n>=1&&n<=300?n:300);__atomic_store_n(&stage_every,every,__ATOMIC_RELEASE); }
+    const int profile_sample = ticket % every == 0;
+    // Immutable per-ticket snapshots: async handlers never read the next frame's globals.
+    // CACurrentMediaTime and Metal GPU/drawable times share the host seconds timebase.
+    const double stage_entry = profile_sample ? CACurrentMediaTime() : 0;
+    const double stage_enqueue = profile_sample && supplied ? g_link_it_tin : 0;
     const uint64_t profile_start = profile_sample ? now_ns() : 0;
     const uint64_t profile_cpu_start = profile_sample ? clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) : 0;
 
@@ -6100,7 +6134,9 @@ static int present_now_impl(const tex_t *t, double period, uint64_t frame, uint6
     uint64_t pn = ticket;   // 按游戏出图序号（票号）记上屏时刻：hle 的上屏统计按「游戏第 n 次出图」取；显示节拍路径里实际出图次数 ≠ 游戏出图次数（旧帧会被合并丢弃） | Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // 真实呈现时刻（屏幕上真正换上这一帧的时间，CACurrentMediaTime 基准） | Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
+        if(display_trace)dm_display_trace_emit("display",dx,CACurrentMediaTime(),tt,0,tt>0);
         g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
+        if (profile_sample) MLOG("iOS17 stage_display ticket=%llu frame=%llu enqueue_s=%.9f entry_s=%.9f target_s=%.9f displayed_s=%.9f callback_s=%.9f valid=%d", (unsigned long long)pn, (unsigned long long)frame, stage_enqueue, stage_entry, target_ts, tt, CACurrentMediaTime(), tt > 0);
     }];
     // 每张至少显示一个出图周期：GPU 完成时刻在 120 Hz 刷新边界附近抖动时，不再出现「25 ms + 8.33 ms」成对的顿挫
     // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
@@ -6111,6 +6147,7 @@ static int present_now_impl(const tex_t *t, double period, uint64_t frame, uint6
     // Direct present also avoids minimum-duration presentation on this layer.
     // 每300张采样一次，GPU回调仅输出自己的command buffer，不把它当整帧耗时。
     // Sample once per 300 presents; GPU callback reports only this command buffer, not whole-frame cost.
+    const double stage_armed = profile_sample ? CACurrentMediaTime() : 0;
     if (profile_sample) {
         const uint64_t sampled_ticket = ticket, sampled_frame = frame;
         const double wall_ms = (now_ns()-profile_start)/1e6;
@@ -6119,16 +6156,24 @@ static int present_now_impl(const tex_t *t, double period, uint64_t frame, uint6
         const double lead_ms = target_ts>0 ? (target_ts-CACurrentMediaTime())*1000 : -1;
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
             double cb_ms = done.GPUEndTime>=done.GPUStartTime ? (done.GPUEndTime-done.GPUStartTime)*1000 : -1;
+            // Final presentation CB only. game_gpu_ms=-1 means not ready/available.
+            // armed->GPU start includes CPU/driver/queue dependencies, not pure GPU idle.
+            MLOG("iOS17 stage_gpu ticket=%llu frame=%llu armed_s=%.9f gpu_start_s=%.9f gpu_end_s=%.9f callback_s=%.9f game_gpu_ms=%.3f status=%lu", (unsigned long long)sampled_ticket, (unsigned long long)sampled_frame, stage_armed, done.GPUStartTime, done.GPUEndTime, CACurrentMediaTime(), mtl_gpu_ms(sampled_frame), (unsigned long)done.status);
             MLOG("iOS17 呈现采样 ticket=%llu frame=%llu queue=%.3fms encode_wall=%.3fms encode_cpu=%.3fms target_lead=%.3fms present_cb_gpu=%.3fms status=%lu", (unsigned long long)sampled_ticket,(unsigned long long)sampled_frame,queue_ms,wall_ms,cpu_ms,lead_ms,cb_ms,(unsigned long)done.status);
         }];
     }
     // Drawable writes are registered at Scheduled, not merely at commit return.
     // Keep direct present for CAMetalDisplayLink, but defer it asynchronously until registration.
-    [cb addScheduledHandler:^(id<MTLCommandBuffer> scheduled) {
-        (void)scheduled;
-        [dr present];
-    }];
-    [cb commit];
+    if(display_trace){
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done){dm_display_trace_emit("gpu",dx,CACurrentMediaTime(),done.GPUStartTime,done.GPUEndTime,(unsigned)done.status);}];
+        dm_display_trace_emit("encoded",dx,CACurrentMediaTime(),dr.texture.width,dr.texture.height,0);
+    }
+    void (^after)(double,double)=nil;
+    if(profile_sample||display_trace)after=^(double begin,double end){
+        if(display_trace)dm_display_trace_emit("present",dx,end,begin,0,0);
+        if(profile_sample)MLOG("iOS17 stage_scheduled ticket=%llu frame=%llu armed_s=%.9f scheduled_s=%.9f present_return_s=%.9f",(unsigned long long)ticket,(unsigned long long)frame,stage_armed,begin,end);
+    };
+    dm_present_schedule(cb,dr,after);
 #if DM_NVN_M3
     if (ticket % 300 == 0) MLOG("iOS17 直接缓冲绑定：native=%llu skipped=%llu cache=%s offset=%llu",(unsigned long long)atomic_load_explicit(&g_m3_bind_native,memory_order_relaxed),(unsigned long long)atomic_load_explicit(&g_m3_bind_skipped,memory_order_relaxed),m3_binding_cache_on()?"on":"off",(unsigned long long)atomic_load_explicit(&g_m3_bind_offset,memory_order_relaxed));
 #endif
@@ -6192,7 +6237,11 @@ __attribute__((weak)) int dm_focus_now(void) { return 1; }   // 宿主 hle_oe.c 
 __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
 @implementation NvMetalDisplayLinkDelegate
 - (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
-    (void)link;
+    const int trace=dm_display_trace_enabled();const double entry=trace?CACurrentMediaTime():0;
+    static uint64_t callback_id;static double previous;
+    dm_display_context dx={0};
+    if(trace){dx=(dm_display_context){++callback_id,0,0,entry,update.targetTimestamp,update.targetPresentationTimestamp,link.preferredFrameLatency,link.preferredFrameRateRange.preferred,0};
+        dm_display_trace_emit("callback",dx,entry,previous?entry-previous:0,update.drawable.layer.maximumDrawableCount,0);previous=entry;}
     pthread_mutex_lock(&g_pq_mu);
     if (g_stall_t0) { uint64_t since = dm_focus_in_since(), t = now_ns();
         MLOG("显示节拍恢复：这段停了 %.0f ms（其中激活中 %.0f ms），兜底丢了 %llu 帧（第 %llu 段）", (t - g_stall_t0) / 1e6, (t - (g_stall_t0 > since ? g_stall_t0 : since)) / 1e6, (unsigned long long)g_stall_drop, (unsigned long long)g_stall_n); g_stall_t0 = 0; }
@@ -6203,7 +6252,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_link_cv);
     pthread_mutex_unlock(&g_link_mu);
     pthread_mutex_lock(&g_pq_mu);
-    if (!g_dm_present_link || g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu); return; }
+    if (!g_dm_present_link || g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu);if(trace){dm_display_trace_emit("empty",dx,CACurrentMediaTime(),0,0,0);dm_display_trace_emit("return",dx,CACurrentMediaTime(),0,0,0);} return; }
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
     pq_item it = g_pq[(g_pq_in - 1) % PQ]; g_link_it_tin = it.t_in;
     g_pq_read = g_pq_in;
@@ -6211,8 +6260,10 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     if (ticket > 1 && g_pq_done < ticket - 1) g_pq_done = ticket - 1;
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
+    if(trace){dx.ticket=ticket;dx.frame=it.frame;dx.step=it.period>0.025?2:1;g_display_context=dx;dm_display_trace_emit("take",dx,CACurrentMediaTime(),it.t_in,0,0);}
     int submitted;
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
+    if(trace){dm_display_trace_emit("return",dx,CACurrentMediaTime(),submitted,0,0);g_display_context=(dm_display_context){0};}
     if (!submitted) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;

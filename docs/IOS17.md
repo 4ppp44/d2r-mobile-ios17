@@ -23,7 +23,7 @@ This invokes generation and an unsigned iOS17/A16 source build only. It delibera
 Generation may be expensive and uses private game-derived headers/art/shaders. No pre-generated substitute is shipped. Asset generation must succeed; a source/unit-test check is not proof a fully assembled game package exists.
 
 ## Known limitations
-- Only iPhone14ProMax/A16 iOS17.0 has the reported short manual test. iOS17.x generally, other models, long sessions, act transitions and full-game completion are not certified.
+- Only iPhone14ProMax/A16 iOS17.0 has reported manual play feedback (including the1705 baseline). iOS17.x generally, other models, long sessions, act transitions and full-game completion are not certified.
 - Occasional ~50ms and longer presentation intervals remain. The old log's fixed25ms drop threshold incorrectly labels normal30FPS intervals as dropped. Conditional FPS averages can omit discarded-ticket gaps. Neither should be used alone as a pass criterion.
 - A request for60Hz callbacks is not a guarantee the OS delivers exactly60; device recordings/logs are still required.
 - Whole-device watts and physical touch-to-photon latency are not measured here. Do not reuse upstream's different-model results as A16 evidence.
@@ -50,3 +50,22 @@ The input directory must contain shaders extracted from your own game by upstrea
 
 ## Shell releases
 Use the same release-tag source with the iOS17 shell build-input ZIP; see [NO_XCODE](NO_XCODE.md). The ZIP is not installable and contains no guest program or game-derived payloads. Guest Mach-O/plist minOS is17.0. This dynamic-guest loading route is distinct from the earlier private embedded1601 test; local reconstruction and build tests are not new A16 gameplay proof.
+
+## Source update through1705
+
+See [CHANGELOG](../CHANGELOG.md). The normal-play build ignores diagnostic profiles from other build identities; ordinary play does not require managing profile files. The60Hz Foundation timer decouples input/UI polling from display refresh requests, not a physical latency guarantee.
+
+Run the asset-free contract on macOS:
+```sh
+sh dm/ios/tests/run_input_profile.sh
+```
+It creates only a disposable fixture folder and checks actual Foundation timer callbacks and build-matched profile selection. It does not operate a phone.
+
+No full new IPA or independent full clean game build is claimed for this source update. Strict17 compile/native/source regression checks are narrower than assembled-game/device proof. Existing preview.1 ZIPs belong to their original tagged source, not1705. Build1705 from the current source with locally generated private assets; do not mix an old host ZIP with new runtime expectations.
+
+### Checks executed for this source sync (2026-10-17)
+- Six runtime translation units compile for arm64/A16 with deployment target17.0 and unguarded-availability errors enabled. This used existing privately generated headers; those headers are not published and this is not a clean full-game rebuild.
+- The actual-Foundation input/profile contract passes12 checks. The previous public source predates the new contract headers; the baseline and restored-copy runner report unavailable (exit1), not an A16 runtime failure.
+- Native NVN75, crop32, pacing23, deswizzle15, texture-range19 and mip303 checks pass. Depth-readonly4 is explicitly mock/no-GPU; copy-pitch invalid/overflow cases pass. Metal checks run on the Mac, not the iPhone.
+- Host touch29, interaction18 and weak-loader contracts pass. Public build/shell/test script syntax passes.
+- Self-contained rollback restores source and documentation on a separate copy; the patch reconstructs every changed file byte-for-byte. No new game IPA, device install, A16 gameplay run, energy reading or complete-game validation is claimed.
