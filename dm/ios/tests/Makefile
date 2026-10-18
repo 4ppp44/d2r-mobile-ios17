@@ -42,7 +42,7 @@ t_joy_travel: t_joy_travel.c ../Sources/dm_touch_controls.c ../Sources/dm_touch_
 	$(CC) $(CFLAGS) -I../Sources t_joy_travel.c ../Sources/dm_touch_controls.c -lm -o $@
 t_metal_cache_guard: t_metal_cache_guard.c ../Sources/dm_metal_cache_guard.c ../Sources/dm_metal_cache_guard.h
 	$(CC) $(CFLAGS) -I../Sources t_metal_cache_guard.c ../Sources/dm_metal_cache_guard.c -o $@
-test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET)
+test: slowframe-check $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET)
 	./$(METAL_CACHE_TARGET)
 	./$(TARGET)
 	./t_skill_aim
@@ -62,3 +62,7 @@ test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL
 	python3 test_touch_receipt.py --source ../Sources/front_ios.m
 clean:
 	rm -f $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET)
+
+.PHONY: slowframe-check
+slowframe-check:
+	python3 test_slowframe.py

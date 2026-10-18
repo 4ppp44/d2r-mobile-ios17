@@ -2,6 +2,10 @@
 
 Unofficial compatibility fork of [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile), retaining upstream history, attribution and MIT license. The goal is to adapt the upstream M3 path to iOS 17, not reimplement the game or claim official Blizzard/upstream support.
 
+## Selective upstream update — 2026-10-19 (source only)
+
+Reviewed upstream v1.0.18 and main9393b00. Backported the merged minimap/layout lifetime fixes and audio mixing fix; independently tested the still-open PR85 timing-report correction. Retains the1705 input/render path and current private IPA, without claiming a full v1.0.18 merge, new A16 FPS/power gains or a new public release. See [imported, existing and deferred changes](docs/UPSTREAM_SYNC_20261019.md). Draft tvOS texture-pressure work is **not** applied to A16 without lifetime/correctness evidence.
+
 ## Current baseline: 1.0.17 / build 2026101705
 
 This update synchronizes cumulative source changes through the locally selected **1705** play baseline, not1706 or unproven experimental patches.

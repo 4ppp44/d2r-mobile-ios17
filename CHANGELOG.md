@@ -2,6 +2,19 @@
 
 This log describes this experimental iOS17 fork, not upstream release promises. Build labels identify local integration baselines; they do not imply a public playable IPA.
 
+## [Unreleased] — 2026-10-19
+
+### Fixed
+- Backport upstream minimap insertion-slot compaction and widget-settling guards, including the330-check production-source regression.
+- Allow Playback audio to mix with other apps without replacing existing interruption handling.
+- Independently adopt open upstream PR85's finite/positive presented-interval validation and windowed-trace denominator handling; add four synthetic regressions to normal tests.
+
+### Validation and limitations
+- Strict iOS17 deployment compilation of six runtime units; existing Foundation input/profile, selected native NVN/real-Mac-Metal and host regressions pass.
+- Matched source baseline / modified / rollback reproduce121 /0 /121 minimap failures and3 /0 /3 analyzer-test failures respectively.
+- Selective review through upstream main9393b00 after v1.0.18; not a full release merge.1705 IPA/resources unchanged; no A16 FPS, latency, energy or thermal gain is claimed. New controls, address-space/rewrite/packaging changes and unmerged tvOS texture-lifetime work are tracked separately.
+- No new playable IPA or release asset is published by this source update.
+
 ## [1.0.17-ios17-build2026101705] — 2026-10-17
 
 ### Changed
