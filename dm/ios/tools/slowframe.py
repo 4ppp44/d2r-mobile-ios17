@@ -82,6 +82,9 @@ def g(d, k):
 def attribute(d):
     """返回 (CPU 侧 ms, 等待侧 ms, 离 CPU 其余 ms, GPU 侧描述, 判定) | Returns (CPU-side ms, wait-side ms, other off-CPU ms, GPU-side description, verdict)"""
     fr, cpu = g(d, "@frame_ms"), g(d, "@cpu_ms")
+    target = g(d, "@target_frame_ms")
+    period = target if target is not None and math.isfinite(target) and target > 0 else PERIOD
+    lim = period * 1.5
     wait, pq = g(d, "@wait_ms") or 0.0, g(d, "@pq_wait_ms") or 0.0
     cpu_ok = cpu is not None and cpu >= 0
     other = fr - cpu - wait - pq if fr is not None and cpu_ok else None
@@ -91,9 +94,9 @@ def attribute(d):
     # 判定：出图调用间隔没超（CPU 按时交了帧）→ GPU / 显示侧；超了 → 看间隔里最大的一块
     # Verdict: present call interval not exceeded (the CPU delivered the frame on time) → GPU / display side; exceeded → look at the largest piece within the interval
     if fr is None: verdict = "缺 @frame_ms"
-    elif fr <= DROP:
-        if gpu_after is not None and gpu_after > PERIOD: verdict = "GPU 侧（出图调用后 %.1f ms 才做完）" % gpu_after
-        elif (g(d, "@drawable_ms") or 0) > PERIOD / 2: verdict = "显示侧（等 drawable %.1f ms）" % d["@drawable_ms"]
+    elif fr <= lim:
+        if gpu_after is not None and gpu_after > period: verdict = "GPU 侧（出图调用后 %.1f ms 才做完）" % gpu_after
+        elif (g(d, "@drawable_ms") or 0) > period / 2: verdict = "显示侧（等 drawable %.1f ms）" % d["@drawable_ms"]
         else: verdict = "CPU 按时、GPU 按时：看前几帧积压 / 系统丢弃"
     elif not cpu_ok: verdict = "间隔超时，缺 @cpu_ms（旧日志或换线程），无法拆"
     else:
@@ -121,7 +124,10 @@ def main(argv):
     key = "@presented_ms" if has_pres else "@frame_ms"
     def slow(d):
         v = d.get(key)
-        return v is not None and (v > DROP or (has_pres and v == -1))
+        if v is None: return False
+        target = d.get("@target_frame_ms")
+        lim = target * 1.5 if target is not None and math.isfinite(target) and target > 0 else DROP
+        return (v > lim or (has_pres and v == -1))
     # 0 / 缺值不可判；只接受有限正间隔及上屏丢弃标记 −1，避免稀释分母。
     # Zero / missing values are unjudged; accept only finite positive intervals and the presentation discard marker -1.
     def valid(d):

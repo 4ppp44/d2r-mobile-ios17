@@ -442,6 +442,15 @@ int main(void) {
     EXPECT("未实现函数被调用后记为已报红", 1, g_unimpl_seen[ui] > 0);
     EXPECT("未实现函数计数 2", 2, nvn_slot[ui].cnt);
 
+    // 8. 诊断冒烟：拓扑探测与翻译细项日志（真实生产路径，无实现镜像断言）
+    atomic_fetch_add(&g_cum_sub_instr, 1000);
+    atomic_fetch_add(&g_cum_sub_cyc, 2000);
+    atomic_fetch_add(&g_cum_sub_cpu_ns, 1000000);
+    tsummary(1);
+    atomic_fetch_add(&g_cum_sub_instr, 10000);
+    atomic_fetch_add(&g_cum_sub_cyc, 25000);
+    atomic_fetch_add(&g_cum_sub_cpu_ns, 10000000);
+    tsummary(300);
     printf("== %d 项，失败 %d ==\n", g_n, g_fail);
     return g_fail != 0;
 }

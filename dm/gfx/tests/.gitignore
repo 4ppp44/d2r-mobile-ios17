@@ -5,6 +5,9 @@ t_deswz_gpu
 t_deswz_gpu.dSYM/
 t_builtin.dSYM/
 t_pace
+t_pace.dSYM/
+t_pres_drop
+t_pres_drop.dSYM/
 .precommit.err
 .precommit_snap/
 t_refl
@@ -43,4 +46,9 @@ t_ub
 t_ub.dSYM/
 t_rt_srgb_view
 t_rt_srgb_view.dSYM/
-t_copy_pitch
+t_vis_retire
+t_vis_retire.dSYM/
+t_pg_lifetime
+t_pg_lifetime.dSYM/
+t_rt_clear_fold
+t_rt_clear_fold.dSYM/

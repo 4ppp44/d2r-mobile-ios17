@@ -2,9 +2,11 @@
 // Diagnostics: probes DM_PROBE, UI message bus DM_UIMSG, main-thread sampling DM_SAMPLE. Split out of crash.c (crash.c only handles signals).
 #include "dm_prof.h"
 #include "dm.h"
+#include "dm_motion_store.h"
 #include "dm_hud.h"
 #include "dm_cursor.h"
 #include "dm_hud_exp.h"
+#include "dm_uiscreen.h"
 #include "dm_elysium.h"
 #include "dm_bossrush.h"
 #include <TargetConditionals.h>
@@ -295,6 +297,21 @@ void dm_prof_mark(const char *seg) {
     pthread_mutex_unlock(&g_proflock);
 }
 static _Atomic uint64_t g_ribbon_ns;
+// 进局装载段（DM_BOOTPROF=1）：读取画面开 → 撤，记墙钟与同一组计数器的增量；进日志并追加到 loadprof.txt（日志在进局时常被冲掉）
+// In-run load segment (DM_BOOTPROF=1): loading screen open → taken down; wall clock and deltas of the same counters; logged and appended to loadprof.txt (the log is often flushed out while entering)
+static struct { uint64_t t, ns[PROF_N], by[PROF_N]; int on; } g_ld;
+static void prof_load_begin(void) {
+    if (!g_flag.bootprof || g_ld.on) return; uint64_t now_ns(void);
+    g_ld.t = now_ns(); for (int k = 0; k < PROF_N; k++) { g_ld.ns[k] = g_pns[k]; g_ld.by[k] = g_pby[k]; } g_ld.on = 1;
+}
+static void prof_load_end(void) {
+    if (!g_flag.bootprof || !g_ld.on) return; uint64_t now_ns(void); g_ld.on = 0;
+    char line[1024]; size_t o = snprintf(line, sizeof line, "进局装载 墙钟 %.3f s：", (now_ns() - g_ld.t) / 1e9);
+    for (int k = 0; k < PROF_N && o < sizeof line; k++) o += snprintf(line + o, sizeof line - o, " %s %.3f", g_pname[k], (g_pns[k] - g_ld.ns[k]) / 1e9);
+    if (o < sizeof line) snprintf(line + o, sizeof line - o, " 读 %.1f MiB 解码 %.1f MiB", (g_pby[PROF_FS_READ] - g_ld.by[PROF_FS_READ]) / 1048576.0, (g_pby[PROF_TACT] - g_ld.by[PROF_TACT]) / 1048576.0);
+    LOG("%s", line);
+    FILE *f = fopen("loadprof.txt", "a"); if (f) { time_t w = time(NULL); struct tm tmv; localtime_r(&w, &tmv); char ts[16]; strftime(ts, sizeof ts, "%H:%M:%S", &tmv); fprintf(f, "%s\t%s\n", ts, line); fclose(f); }
+}
 static void prof_on_uimsg(uint64_t act, const char *arg) {   // UI 消息边界（动作哈希按 FNV-1a） | UI message boundary (action hash by FNV-1a)
     if (!g_flag.bootprof) return;
     static int seen_fe, seen_open, seen_close;
@@ -336,7 +353,7 @@ void uimsg_subscribe(void (*fn)(const char *cat, const char *act, const char *ar
 #define UIH_MONSTERHEALTH 0xd3a07a5ecad1a9a3ull
 #define UIH_SETINFO       0x40ffba2d98a3ff97ull
 static void monres_on_setinfo(const uint64_t *regs, uint64_t payload) {
-    int dm_custom_get(const char *key); if (!dm_custom_get("item_notes") || dm_lang_index() != 8) return;   // 物品注释一系只有简中版（英文版：别的语言不显示；注释只写进 zhCN 一列） | the item-notes family exists only in Simplified Chinese (English version: not shown in other languages; notes are written only into the zhCN column)
+    int dm_custom_get(const char *key); if (!dm_custom_get("item_notes") || dm_lang_index() != 8) return;   // 简体中文的怪物抗性注释 | Simplified Chinese monster resistance annotations
     module_t *mm = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) mm = &g_mod[i];
     uint64_t unit = regs[19], name = 0; uint32_t type = 0; vm_size_t got = 0;
     if (!mm || !unit || vm_read_overwrite(mach_task_self(), unit, 4, (vm_address_t)&type, &got) || type != 1) return;   // 只认怪物（单位类型 1） | Monsters only (unit type 1)
@@ -383,9 +400,13 @@ static void uimsg_print(const uint64_t *regs) {   // 观测门回调：只读寄
     { static int played, back; if (!strcmp(n0, "FrontEndNavigation") && !strcmp(n1, "ToGame")) { played = 1; back = 0; crash_watch_pregame_done(); }
       else if (!strcmp(n0, "FrontEndNavigation") && !strcmp(n1, "ToFrontEnd") && played) { back = 1; void crash_watch_pregame_again(void); crash_watch_pregame_again(); }
       else if (have_arg && !strcmp(nm, "MainMenuButtonRibbon") && !back) crash_watch_pregame_done(); }
+    const char *cat = uih_name(f[0], b0), *act = uih_name(f[1], b1);
+    if (!strcmp(cat, "PanelManager") && have_arg) {   // 长帧日志的上下文：记最近打开且未关的面板 | Context for the long-frame log: remember the most recently opened and not yet closed panel
+        extern char g_lf_panel[48];
+        if (!strcmp(act, "OpenPanel")) strlcpy(g_lf_panel, nm, sizeof g_lf_panel); else if (!strcmp(act, "ClosePanel") && !strcmp(g_lf_panel, nm)) g_lf_panel[0] = 0;
+    }
     for (int k = 0, n = atomic_load(&g_nui_sub); k < n; k++) { char s0[24], s1[24]; g_ui_sub[k](uih_name(f[0], s0), uih_name(f[1], s1), have_arg ? nm : ""); }
     if (!g_ui_print) return;
-    const char *cat = uih_name(f[0], b0), *act = uih_name(f[1], b1);
     pthread_mutex_lock(&g_uilock);
     if (g_uifp) {
         fprintf(g_uifp, "{\"seq\":%u,\"cat_h\":\"0x%016llx\",\"act_h\":\"0x%016llx\",\"arg\":", g_uiseq++, f[0], f[1]);
@@ -394,10 +415,6 @@ static void uimsg_print(const uint64_t *regs) {   // 观测门回调：只读寄
         if (act != b1) { fputs(",\"act\":", g_uifp); json_str(g_uifp, act); }
         if (in_game()) fprintf(g_uifp, ",\"tick\":%u", cur_tick());   // 局内带服务端当前拍号（触屏用例按拍对齐面板开关；uicmp 只比 cat_h/act_h/arg，不受影响） | In a run, include the server's current tick number (touch test cases align panel open/close by tick; uicmp only compares cat_h/act_h/arg and is unaffected)
         fputs("}\n", g_uifp); fflush(g_uifp);
-    }
-    if (!strcmp(cat, "PanelManager") && have_arg) {   // 长帧日志的上下文：记最近打开且未关的面板 | Context for the long-frame log: remember the most recently opened and not yet closed panel
-        extern char g_lf_panel[48];
-        if (!strcmp(act, "OpenPanel")) strlcpy(g_lf_panel, nm, sizeof g_lf_panel); else if (!strcmp(act, "ClosePanel") && !strcmp(g_lf_panel, nm)) g_lf_panel[0] = 0;
     }
     extern uint64_t g_t0_ns; uint64_t now_ns(void);
     static uint64_t last[2]; static char lastnm[65]; static unsigned rep;   // stderr 摘要：相邻相同合并计数 | stderr summary: adjacent identical lines are merged with a count
@@ -519,12 +536,45 @@ static void *sampler(void *p) {
     }
 }
 void crash_sample_self(void) {
-    const char *e = getenv("DM_SAMPLE"); if (!e) return;
+    const char *e = getenv("DM_SAMPLE");
+#if TARGET_OS_IPHONE
+    static char s_buf[64];
+    if (!e) {
+        const char *home = getenv("HOME");
+        if (home) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s/Documents/dm_sample.txt", home);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(s_buf, sizeof s_buf, f)) {
+                    char *nl = strpbrk(s_buf, "\r\n"); if (nl) *nl = '\0';
+                    char *p = s_buf; while (*p == ' ' || *p == '\t') p++;
+                    if (!strcmp(p, "0") || !strcasecmp(p, "off") || !strcasecmp(p, "no") || !strcasecmp(p, "false")) {
+                        LOG("采样诊断: Documents/dm_sample.txt 显式禁用 (0/off)");
+                        fclose(f);
+                        return;
+                    }
+                    if (*p) e = p;
+                }
+                fclose(f);
+            }
+        }
+    }
+    // 2305 专属：若未在文件或环境变量中显式配置，缺省启用 10ms 客体主线程采样
+    if (!e) {
+        e = "10";
+        LOG("采样诊断: 2305 默认启用 10ms 客体主线程采样(可通过 Documents/dm_sample.txt 调整或填 0 禁用)");
+    }
+#endif
+    if (!e) return;
+    int ms = atoi(e);
+    if (ms <= 0) return;
     g_sample_pt = pthread_self();
     const char *c = strchr(e, ':'); if (c) g_sample_name = strdup(c + 1);
+    LOG("采样诊断: 启动客体采样,间隔 %d ms,目标 %s", ms, g_sample_name ? g_sample_name : "主线程");
     struct sigaction sa = {.sa_sigaction = on_sample, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART};
     sigaction(SIGUSR2, &sa, 0);
-    pthread_t t; pthread_create(&t, NULL, sampler, (void *)(uintptr_t)(atoi(e) * 1000)); pthread_detach(t);
+    pthread_t t; pthread_create(&t, NULL, sampler, (void *)(uintptr_t)(ms * 1000)); pthread_detach(t);
 }
 
 // ---------- DM_INFLATE_BENCH=<样本文件>：用游戏映像里的 zlib（main 0xf3a930 inflateInit_、0xf3aa90 inflate）解同一批样本并计时 ----------
@@ -1498,47 +1548,57 @@ static void hold_on_uimsg(const char *cat, const char *act, const char *arg) {
     char m[256]; snprintf(m, sizeof m, "%s:%s:%s", cat, act, arg);
     if (strcmp(g_hold_ui, "SHOT") && atomic_load(&g_holding) && strstr(m, g_hold_ui)) hold_release(m);
 }
-// ---- 常开轻量性能记录：每 10 秒往 perf.txt 追加一行，供直装实玩后取回（iOS 工作目录 = Documents，已开文件共享）----
+// ---- 常开轻量性能记录：iOS 每 10 秒通过 LOG 后台写入汇总 ----
 // 列：墙钟时刻 / 进程秒 / 温控档位 / 3D 渲染比例 / 上屏帧率 / 帧间隔落在 16.7、25、≥33 ms 三档的占比（界线 20.8、29.2 ms）与被丢弃帧数 /
 //     每帧提交 CPU ms / 场景（局内 Lv 或 菜单）。数据源 = hle_nvn.c 的实际上屏间隔（与 boot.txt「上屏」行同源），不另做统计口径。
-// iOS 缺省开；DM_PERF_FILE=<路径> 指定文件（Mac 上只有设了才写），DM_PERF_FILE=0 关。文件到 256 KB 时改名 perf.old.txt 重新开始。
-// ---- Always-on lightweight perf record: append one line to perf.txt every 10 seconds, to be pulled back after a direct-install real play session (iOS working directory = Documents, file sharing enabled) ----
+// iOS 默认通过 LOG 后台写入 boot.txt；DM_PERF_FILE=<路径> 是显式同步文件诊断，0 关闭汇总。
+// ---- Always-on lightweight perf record: iOS emits a buffered LOG summary every 10 seconds ----
 // Columns: wall-clock time / process seconds / thermal state / 3D render scale / present frame rate / share of frame intervals falling in the 16.7, 25, ≥33 ms buckets (boundaries 20.8, 29.2 ms) and number of dropped frames /
 //     per-frame submit CPU ms / scene (in-run Lv or menu). Data source = the actual present intervals in hle_nvn.c (same source as the 「上屏」(present) line in boot.txt); no separate statistic is kept.
-// On by default on iOS; DM_PERF_FILE=<path> picks the file (on Mac it is only written when set), DM_PERF_FILE=0 turns it off. When the file reaches 256 KB it is renamed perf.old.txt and started over.
+// iOS defaults to buffered LOG in boot.txt. DM_PERF_FILE=<path> explicitly opts into synchronous file diagnostics; 0 disables the summary.
 #include <TargetConditionals.h>
 #include <sys/stat.h>
 #include <time.h>
 int dm_thermal_now(void);
 int dm_ingame_now(void) { dm_hud_info h; dm_hud_get(&h); return h.valid; }   // 当前是否在局内（读到受控玩家）：动态 3D 比例只在局内判 | Whether we are in a run right now (the controlled player was read): the dynamic 3D scale is only evaluated in a run
 // ---- 长帧日志：hle_nvn.c 在某帧 > 20 ms（或 GPU > 16.7 ms）时调一次；这里补上「读取画面是否盖着 / 当前面板 / 区域号」，
-// 写进 boot.txt（LOG）并追加到 perf.txt（行首「长帧」，与每 10 秒的汇总行同一文件，实玩后取回能直接看见卡在哪一帧、卡在什么上）----
+// 默认只写 boot.txt（有界后台 LOG）；显式 DM_PERF_FILE 才额外写 perf 文件。
 // ---- Long-frame log: hle_nvn.c calls this once when a frame is > 20 ms (or GPU > 16.7 ms); this adds "whether the loading screen is covering / current panel / area number",
-// writes it to boot.txt (LOG) and appends it to perf.txt (line prefix 「长帧」(long frame), the same file as the every-10-seconds summary lines, so after real play it can be retrieved and you can see directly which frame stalled and on what) ----
+// Default output is buffered LOG in boot.txt; an explicit DM_PERF_FILE additionally enables the synchronous perf sink.
 char g_lf_panel[48];
 static int g_loadscreen_seen;
 int dm_loadscreen_up(void);
+static FILE *g_perf_fp;
 void dm_longframe_note(const char *what) {
     static const char *path; static int init; static unsigned n;
-    if (!init) { init = 1; const char *e = getenv("DM_PERF_FILE"); path = e ? (strcmp(e, "0") ? e : NULL) : (TARGET_OS_IPHONE ? "perf.txt" : NULL); }
+    if (!init) {
+        init = 1;
+        const char *e = getenv("DM_PERF_FILE");
+        path = e && strcmp(e, "0") ? e : NULL;
+        if (path) {
+            g_perf_fp = fopen(path, "a");
+            if (g_perf_fp) setvbuf(g_perf_fp, NULL, _IOLBF, 0);
+        }
+    }
     dm_hud_info h; dm_hud_get(&h); char ctx[160];
-    snprintf(ctx, sizeof ctx, "读取画面 %s，面板 %s，区域 %d%s", g_loadscreen_seen ? (dm_loadscreen_up() ? "盖着" : "已撤") : "未见过", g_lf_panel[0] ? g_lf_panel : "无", h.area, h.valid ? "" : "（未读到玩家）");
+    int p_open = dm_uiscreen_panel();
+    const char *pn = g_lf_panel[0] ? g_lf_panel : (p_open ? "大面板（开着）" : "无");
+    snprintf(ctx, sizeof ctx, "读取画面 %s，面板 %s，区域 %d%s", g_loadscreen_seen ? (dm_loadscreen_up() ? "盖着" : "已撤") : "未见过", pn, h.area, h.valid ? "" : "（未读到玩家）");
     LOG("[长帧] %s；%s", what, ctx);
-    if (!path || n++ >= 2000) return;   // 一次运行最多落 2000 行，防异常刷屏把文件撑大 | At most 2000 lines are written per run, to keep abnormal log flooding from bloating the file
-    FILE *fp = fopen(path, "a"); if (!fp) return;
+    if (!g_perf_fp || n++ >= 2000) return;   // 一次运行最多落 2000 行，防异常刷屏把文件撑大 | At most 2000 lines are written per run, to keep abnormal log flooding from bloating the file
     time_t w = time(NULL); struct tm tmv; localtime_r(&w, &tmv); char ts[16]; strftime(ts, sizeof ts, "%H:%M:%S", &tmv);
-    fprintf(fp, "长帧\t%s\t%s；%s\n", ts, what, ctx); fclose(fp);
+    fprintf(g_perf_fp, "长帧\t%s\t%s；%s\n", ts, what, ctx);
 }
 void dm_perf_present(double iv) {   // 出图线程每帧调一次（滞后 8 帧的实际上屏间隔 ms；−1 = 被系统丢弃，0 = 无读数） | Called once per frame by the present thread (the actual present interval in ms, lagging by 8 frames; −1 = dropped by the system, 0 = no reading)
-    static const char *path; static int init; static unsigned c16, c25, c33, disc; static double sum; static uint64_t t0, f0, cpu0, tstart;
-    if (!init) { init = 1; const char *e = getenv("DM_PERF_FILE"); path = e ? (strcmp(e, "0") ? e : NULL) : (TARGET_OS_IPHONE ? "perf.txt" : NULL); t0 = tstart = now_ns(); f0 = dm_nvn_frame_count(); cpu0 = dm_nvn_sub_cpu_ns(); }
+    static const char *path; static int init, enabled; static unsigned c16, c25, c33, disc; static double sum; static uint64_t t0, f0, cpu0, tstart;
+    if (!init) { init = 1; const char *e = getenv("DM_PERF_FILE"); path = e && strcmp(e, "0") ? e : NULL; enabled = e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE; t0 = tstart = now_ns(); f0 = dm_nvn_frame_count(); cpu0 = dm_nvn_sub_cpu_ns(); }
     dm_3d_scale_feed(iv);   // 动态 3D 比例的控制器吃同一份上屏间隔（hle_oe.c） | The dynamic 3D scale controller consumes the same present intervals (hle_oe.c)
-    if (!path) return;
+    if (!enabled) return;
     if (iv < 0) disc++; else if (iv > 0) { sum += iv; if (iv <= 20.8) c16++; else if (iv <= 29.2) c25++; else c33++; }
     uint64_t now = now_ns(); if (now - t0 < 10000000000ull) return;
     unsigned n = c16 + c25 + c33; uint64_t f = dm_nvn_frame_count(), cpu = dm_nvn_sub_cpu_ns();
-    struct stat st; if (!stat(path, &st) && st.st_size > 256 * 1024) rename(path, "perf.old.txt");
-    FILE *fp = fopen(path, "a");
+    struct stat st; if (path && !stat(path, &st) && st.st_size > 256 * 1024) rename(path, "perf.old.txt");
+    FILE *fp = path ? fopen(path, "a") : NULL;
     if (fp) {
         if (ftell(fp) == 0) fprintf(fp, "# 时刻\t进程秒\t温控\t3D比例\t上屏帧率\t16.7ms档%%\t25ms档%%\t≥33ms档%%\t丢弃帧\t提交CPUms\t场景\n");
         time_t w = time(NULL); struct tm tmv; localtime_r(&w, &tmv); char ts[16]; strftime(ts, sizeof ts, "%H:%M:%S", &tmv);
@@ -1791,7 +1851,7 @@ static void loadscreen_close_now(unsigned generation) {
     pthread_mutex_lock(&g_shotgate_mu);
     if (generation == g_loadscreen_generation && g_loadscreen_unload_pending) {
         g_loadscreen_unload_pending = 0; g_loadscreen_open = 0;
-        LOG("读取画面已撤");
+        LOG("读取画面已撤"); prof_load_end();
     }
     pthread_mutex_unlock(&g_shotgate_mu);
     if (!dm_loadscreen_up()) { lhold_release(); atomic_store(&g_lhold_giveup, 0); }
@@ -1834,14 +1894,14 @@ static void loadscreen_on_uimsg(const char *cat, const char *act, const char *ar
     if (strcmp(arg, "LoadScreenPanel")) return;
     pthread_mutex_lock(&g_shotgate_mu);
     if (!strcmp(act, "OpenPanel") || !strcmp(act, "OpenExclusivePanel")) {
-        g_loadscreen_seen = 1; g_loadscreen_open = 1; g_loadscreen_unload_pending = 0; g_loadscreen_generation++;
+        g_loadscreen_seen = 1; g_loadscreen_open = 1; g_loadscreen_unload_pending = 0; g_loadscreen_generation++; prof_load_begin();
         pthread_mutex_unlock(&g_shotgate_mu); return;
     }
     if (strcmp(act, "UnloadPanel") && strcmp(act, "ClosePanel")) { pthread_mutex_unlock(&g_shotgate_mu); return; }
     g_loadscreen_seen = 1; g_loadscreen_generation++;
     if (!g_loadscreen_delay_ms) {
         g_loadscreen_open = 0; g_loadscreen_unload_pending = 0;
-        pthread_mutex_unlock(&g_shotgate_mu); LOG("读取画面已撤"); lhold_release(); return;
+        pthread_mutex_unlock(&g_shotgate_mu); LOG("读取画面已撤"); prof_load_end(); lhold_release(); return;
     }
     g_loadscreen_unload_pending = 1;
     unsigned *generation = malloc(sizeof *generation); *generation = g_loadscreen_generation;

@@ -98,7 +98,7 @@ The scripts in `tools/`; usage is written in each file's header:
 | `shader_map.py`, `maxwell_refs.py` | Generates the shader map; reads resource references from the machine code |
 | `nvn_slots.py`, `gen_protos.py` | Generate `nvn_slots.tsv` / `names.txt`, and `nvn_protos.h` / the thunks |
 | `tbdr_budget.py`, `tbdr_load_dead.py`, `tbdr_store_dead.py`, `tbdr_pass_merge.py` | Read the `DM_NVN_PASSDUMP` log and analyze the load / store volume of each render pass's attachments per frame |
-| `passgpu_top.py` | Reads the `DM_NVN_PASSGPU` output and lists GPU time by pass |
+| `passgpu_top.py` | Reads the `DM_NVN_PASSGPU` output and lists GPU time by pass. Pass either the measurement directory (looks only for `passes.tsv`, then the legacy `passgpu.tsv`, inside it) or the table file itself: `passgpu_top.py <dir|file> [min_frame] [top_n]`. The device profile starts at frame 0, so use a floor of `-1` to see everything |
 | `nometal_run.py` | Runs this translation chain on a machine without Apple's Metal compiler: shaders go into the libraries as source and are compiled on the phone |
 
 ## Building

@@ -47,6 +47,9 @@ typedef struct thr {
     // 当前等待：kind 0=无 1=锁 2=条件 3=地址 4=同步对象
     // Current wait: kind 0=none 1=lock 2=condition 3=address 4=synchronization object
     int wkind, woke; uint64_t waddr, wkey; uint32_t wtag; int64_t wres;
+    // 自旋中：block_inner 放开 G 轮询 woke 的那段（持 G 置位、清零）。wake 见到它就不发信号
+    // Spinning: the stretch where block_inner polls woke with G released (set and cleared under G). wake sends no signal then
+    int spinning;
     uint64_t wseq;             // 登记等待的先后序号：同优先级先到先醒（与 Horizon 内核 KThread 等待树同序） | Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
     struct thr *next;          // 等待链 | Wait chain
     struct thr *all;           // 全部线程链（现场导出用） | All-threads chain (for the state dump)
@@ -103,17 +106,55 @@ static thr_t *pick(int kind, uint64_t a) {
     }
     return b;
 }
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); }
+// 目标在自旋时不发信号：它见到 woke 就持 G 返回，不进条件等待；安卓 bionic 的 pthread_cond_signal 不论有没有人在等都做一次
+// futex 唤醒系统调用。计数给帧 TSV（@wakes、@wake_skips）
+// No signal when the target is spinning: it returns under G once it sees woke and never enters the condition wait. Android
+// bionic's pthread_cond_signal makes a futex wake system call whether or not anyone waits. The counts go to the frame TSV
+// (@wakes, @wake_skips)
+static uint64_t g_wakes, g_wake_skips;
+void dm_hle_wake_counts(uint64_t *wakes, uint64_t *skips) { *wakes = __atomic_load_n(&g_wakes, __ATOMIC_RELAXED); *skips = __atomic_load_n(&g_wake_skips, __ATOMIC_RELAXED); }
+static void wake(thr_t *t, int64_t res) {
+    wait_unlink(t); t->wkind = 0; t->wres = res;
+    // woke 最后写：block_inner 可能不持 G 轮询它
+    // woke last: block_inner may poll it without G
+    __atomic_store_n(&t->woke, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_wakes, g_wakes + 1, __ATOMIC_RELAXED);
+    if (t->spinning) __atomic_store_n(&g_wake_skips, g_wake_skips + 1, __ATOMIC_RELAXED);
+    else pthread_cond_signal(&t->cv);
+}
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
+// Main-thread wait totals are sampled at frame boundaries; no I/O on the wait path.
+static uint64_t g_main_block_n, g_main_block_ns;
+void dm_main_block_stats(uint64_t *n, uint64_t *ns) { *n = g_main_block_n; *ns = g_main_block_ns; }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
 static int64_t block(thr_t *t, int kind, int64_t ns) {   // 启动时间线：按等待种类累计（全线程）+ 主线程单列 | Boot timeline: accumulated by wait kind (all threads) + the main thread listed separately
-    if (!g_flag.bootprof) return block_inner(t, kind, ns);
+    int main = t->handle == 0x1001;
+    if (!g_flag.bootprof && !main) return block_inner(t, kind, ns);
     uint64_t t0 = now_ns(); int64_t r = block_inner(t, kind, ns); uint64_t d = now_ns() - t0;
-    static const int id[] = {0, PROF_WAIT_LOCK, PROF_WAIT_CV, PROF_WAIT_ADDR, PROF_WAIT_SYNC};
-    dm_prof_add(id[kind & 7], d, 0);
-    if (t->handle == 0x1001) dm_prof_add(PROF_MAIN_WAIT, d, 0);
+    if (main) { g_main_block_n++; g_main_block_ns += d; }
+    if (g_flag.bootprof) {
+        static const int id[] = {0, PROF_WAIT_LOCK, PROF_WAIT_CV, PROF_WAIT_ADDR, PROF_WAIT_SYNC};
+        dm_prof_add(id[kind & 7], d, 0);
+        if (main) dm_prof_add(PROF_MAIN_WAIT, d, 0);
+    }
     return r;
+}
+// 主线程的短等待先自旋再睡：D2R 主线程每帧约 45 次等工作线程持有的客体锁，81% 只等 10–25 µs（Redmi K50 Ultra 营地），其中大半是
+// futex 睡下、唤醒与核心退出空闲的开销，而不是持锁时间。先照常登记为等待者（交接仍会选中它），放开 G，轮询自己的 woke 至多
+// g_spin_ns，再照旧睡。宿主不要求就不开：DM_HLE_SPIN_US（安卓 App 设置）；只有客体主线程自旋。
+// 对照：DM_HLE_SPIN_AB=N 时只在偶数个 N 秒里自旋，与引擎的 gfx-ab-toggle 同相位（单调时钟秒数 / N 为偶数 = 开）。
+// Short waits of the main thread spin before they sleep. D2R's main thread waits ~45 times a frame on guest locks held by its
+// job workers, 81% of them for 10–25 us (Redmi K50 Ultra camp), and most of that is the futex sleep, the wake-up and the
+// core's idle exit rather than the holder. The thread registers as a waiter as before (so a handoff still picks it), releases
+// G and polls its woke flag for up to g_spin_ns, then sleeps as before. Off unless the host asks: DM_HLE_SPIN_US (the Android
+// app sets it); only the guest main thread spins.
+// A/B: with DM_HLE_SPIN_AB=N the thread spins only in even N-second periods, in phase with the engine's gfx-ab-toggle
+// (monotonic seconds / N even = on).
+static uint64_t g_spin_ns; static int g_spin_init; static int64_t g_spin_ab;
+static int spin_phase_on(void) {
+    if (g_spin_ab <= 0) return 1;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ((ts.tv_sec / g_spin_ab) & 1) == 0;
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
@@ -123,6 +164,20 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
     if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
+    if (!g_spin_init) { const char *e = getenv("DM_HLE_SPIN_US"); g_spin_ns = e ? (uint64_t)atoi(e) * 1000 : 0; e = getenv("DM_HLE_SPIN_AB"); g_spin_ab = e ? atoi(e) : 0; g_spin_init = 1; }   // under G
+    if (g_spin_ns && t->handle == 0x1001 && (ns < 0 || (uint64_t)ns > g_spin_ns) && spin_phase_on()) {
+        t->spinning = 1;
+        pthread_mutex_unlock(&G);
+        uint64_t end = now_ns() + g_spin_ns;
+        while (!__atomic_load_n(&t->woke, __ATOMIC_ACQUIRE) && now_ns() < end) {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        }
+        pthread_mutex_lock(&G);
+        t->spinning = 0;
+        if (t->woke) return t->wres;   // woken while spinning: wres was written under G before the waker released it
+    }
     while (!t->woke) {
         int rc;
         if (det_wait) {
@@ -215,8 +270,17 @@ uint32_t svc_thread_main_init(void) {
     return t->handle;
 }
 
-static uint64_t g_main_yield_n, g_main_yield_ns;   // 只有客体主线程写；诊断行在同一线程读 | Written only by the guest main thread; the diagnostic line reads it on the same thread
-void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = g_main_yield_n; *ns = g_main_yield_ns; }
+// 单个客体主线程写；导出线程用 relaxed 原子读取独立累计值（不是事务快照）。
+// One guest-main writer; export uses relaxed atomics for independent totals, not a transactional snapshot.
+static uint64_t g_main_yield_n, g_main_yield_ns;
+void dm_main_yield_stats_v2(uint64_t *n, uint64_t *ns, uint64_t *backoff_n) {
+    *n = __atomic_load_n(&g_main_yield_n, __ATOMIC_RELAXED);
+    *ns = __atomic_load_n(&g_main_yield_ns, __ATOMIC_RELAXED);
+    if (backoff_n) *backoff_n = 0;
+}
+void dm_main_yield_stats(uint64_t *n, uint64_t *ns) {
+    dm_main_yield_stats_v2(n, ns, NULL);
+}
 uint32_t dm_guest_work_qos(unsigned *count) {
     uint32_t qos = QOS_CLASS_UNSPECIFIED; unsigned n = 0;
     pthread_mutex_lock(&G);
@@ -436,7 +500,9 @@ void svc_thread_dump(void) {
 }
 
 int svc_thread(int num, uint64_t *regs) {
-    { thr_t *me = pthread_getspecific(g_keythr); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++; } }
+    { thr_t *me = pthread_getspecific(g_keythr);
+      if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++; }
+    }
     if (g_flag.thr && num != 0x0B) { thr_t *me = pthread_getspecific(g_keythr); LOG("[%#x] svc %#x x0=%#llx x1=%#llx x2=%#llx x3=%#llx", me ? me->handle : 0, num, regs[0], regs[1], regs[2], regs[3]); }
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
@@ -470,8 +536,15 @@ int svc_thread(int num, uint64_t *regs) {
         } else if (ns > 0) { struct timespec ts = {ns / 1000000000, ns % 1000000000}; nanosleep(&ts, 0); }
         else {   // 让出（0 / -1 / -2）。主线程的让出次数与耗时记账：游戏渲染任务图「等全部做完」是纯轮询 + 让出（main+0x15ee898），量它占一帧多少 | Yield (0 / -1 / -2). Count and time of the main thread's yields are recorded: the game's render task graph "wait for everything to finish" is pure polling + yield (main+0x15ee898); measure how much of a frame it takes
             thr_t *me = pthread_getspecific(g_keythr);
-            if (me && me->handle == 0x1001) { uint64_t y0 = now_ns(); sched_yield(); g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
-            else sched_yield();
+            if (me && me->handle == 0x1001) {
+                uint64_t y0 = now_ns();
+                sched_yield();
+                uint64_t y1 = now_ns();
+                __atomic_store_n(&g_main_yield_ns, __atomic_load_n(&g_main_yield_ns, __ATOMIC_RELAXED) + y1 - y0, __ATOMIC_RELAXED);
+                __atomic_store_n(&g_main_yield_n, __atomic_load_n(&g_main_yield_n, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+            } else {
+                sched_yield();
+            }
         }
         if (g_flag.bootprof) { uint64_t d = now_ns() - t0; dm_prof_add(PROF_SLEEP, d, 0); thr_t *me = pthread_getspecific(g_keythr); if (me && me->handle == 0x1001) dm_prof_add(PROF_MAIN_WAIT, d, 0); }
         return 1;

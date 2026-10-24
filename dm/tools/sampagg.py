@@ -26,7 +26,7 @@ def dm(fn):
     return subprocess.run(['xcrun', 'c++filt', r], capture_output=True, text=True).stdout.strip()[:70]
 per = collections.defaultdict(lambda: [0, 0, collections.Counter()]); selfc = collections.Counter(); incl = collections.Counter(); host = collections.Counter(); waitat = collections.Counter(); n = 0
 for i, l in enumerate(lines):
-    m = re.match(r'\[dm\] SAMPLE #\d+ \[([\d.]+)s\] thr=(0x[0-9a-f]+) pc=(\S+)', l)
+    m = re.match(r'\[dm\] SAMPLE #\d+ \[(\d+(?:\.\d+)?)s\] thr=(0x[0-9a-f]+) pc=(\S+)', l)
     if not m or not (lo <= float(m.group(1)) <= hi): continue
     h = int(m.group(2), 16); pc = m.group(3); p = per[h]
     bt = lines[i + 1].split('bt:')[1].split() if i + 1 < len(lines) and 'bt:' in lines[i + 1] else []

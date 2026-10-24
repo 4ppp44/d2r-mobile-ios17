@@ -122,5 +122,51 @@ int main(void) {
  mv_offset(MV_LIFT,ptr(incoming),1,-511,0); CHECK(*y(incoming)==-499);
  mv_restore(ptr(root),MV_LIFT); CHECK(*y(incoming)==12 && g_nmv==0);
  for(int i=1;i<96;i++) CHECK(*y(old[i])==100+i);
+ {
+  _Alignas(8) static unsigned char notif[512], vendor[160], vendor_leaf[160];
+  memset(notif, 0, sizeof notif);
+  *(const char **)(notif + 8) = "NotificationPanel";
+  *(int32_t *)(notif + 0x74) = -790;
+  *(int32_t *)(notif + 0x78) = 800;
+  *(int32_t *)(notif + 0x7c) = 244;
+  *(uint8_t *)(notif + 0x50) = 1;
+  *(uint8_t *)(notif + 0x198) = 1;
+  *(int32_t *)(notif + 0x19c) = -790;
+  memset(vendor, 0, sizeof vendor);
+  *(const char **)(vendor + 8) = "VendorPanelLayout";
+  *(uint8_t *)(vendor + 0x50) = 1; *(uint8_t *)(vendor + 0x51) = 1;
+  memset(vendor_leaf, 0, sizeof vendor_leaf);
+  *(uint8_t *)(vendor_leaf + 0x50) = 1; *(uint8_t *)(vendor_leaf + 0x51) = 1;
+  static uint64_t vch[1]; vch[0] = ptr(vendor_leaf);
+  *(uint64_t *)(vendor + 0x58) = ptr(vch); *(uint64_t *)(vendor + 0x60) = 1;
+  static uint64_t root_ch[4]; root_ch[0] = ptr(notif); root_ch[1] = ptr(vendor);
+  *(uint64_t *)(root + 0x58) = ptr(root_ch); *(uint64_t *)(root + 0x60) = 2;
+  ingame = 1; g_nd_hold = 0;
+  *(int32_t *)(base + 0x211da38) = 2796; *(int32_t *)(base + 0x211da3c) = 1290;
+  ui_note_dock_pump(ptr(root));
+  CHECK(*(int32_t *)(notif + 0x19c) == -310);
+  CHECK(*(int32_t *)(notif + 0x74) == -310);
+  CHECK(g_nd_on == 1);
+  atomic_store(&g_tip_fr, frame);
+  g_tip_box[0] = 1527; g_tip_box[1] = 880; g_tip_box[2] = 2171; g_tip_box[3] = 1164;
+  ui_note_dock_pump(ptr(root));
+  int32_t avoided_y = *(int32_t *)(notif + 0x19c);
+  CHECK(avoided_y < -790);
+  CHECK(g_nd_on == 1);
+  for (int i = 0; i < 10; i++) {
+   frame++; atomic_store(&g_tip_fr, frame);
+   ui_note_dock_pump(ptr(root));
+   CHECK(*(int32_t *)(notif + 0x19c) == avoided_y);
+   CHECK(g_nd_on == 1);
+  }
+  frame += 5;
+  ui_note_dock_pump(ptr(root));
+  CHECK(*(int32_t *)(notif + 0x19c) == -310);
+  CHECK(g_nd_on == 1);
+  *(uint8_t *)(vendor + 0x50) = 0;
+  ui_note_dock_pump(ptr(root));
+  CHECK(*(int32_t *)(notif + 0x19c) == -790);
+  CHECK(g_nd_on == 0);
+ }
  free(base); printf("t_minimap_lift: %d checks, %d failures\n",checks,fails); return fails!=0;
 }

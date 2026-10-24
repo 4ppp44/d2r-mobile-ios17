@@ -19,11 +19,15 @@
 // Every implementation gets a compile-time signature check against the prototypes in nvn_protos.h (NVNboolean parameters are received as uint32_t, only the low 8 bits are looked at).
 // Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
 #include "../../host/hle.h"
+#include "../../host/dm_motion.h"
+extern float dm_3d_scale_cur(void) __attribute__((weak_import));
+__attribute__((weak)) void dm_hle_wake_counts(uint64_t *wakes, uint64_t *skips) { if (wakes) *wakes = 0; if (skips) *skips = 0; }
 #include "nvn_protos.h"
 #include "nvn_count.h"
 #include "nvn_tex.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
+#include "nvn_adaptive_pace.h"
 #include "../../host/front.h"
 #include "nvn_dirty.h"
 #include <mach/mach_time.h>
@@ -38,6 +42,7 @@
 #endif
 #include <pthread/qos.h>
 #include <sys/resource.h>
+#include <sys/sysctl.h>
 #include <mach/thread_policy.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -828,6 +833,7 @@ typedef struct { const char *who; double comp_ms, period_ms; uint64_t last; doub
 static rt_decl g_rt_main = {"出图线程"}, g_rt_xlat = {"翻译线程"};
 static void set_time_constraint(rt_decl *d, uint64_t period_ns);
 static void rt_comp_tick(rt_decl *d, uint64_t period_ns);
+static int xlat_rt_on(void);
 // ---------- 翻译队列（B 方案第二期）：提交 / 出图 / 设帧号按序排给翻译线程，游戏线程只登记、立刻返回 ----------
 // 游戏逻辑与上一帧的翻译（回放 + Metal 编码）重叠。栅栏值 = 已入队的提交数：Metal 层每次提交恰好 ++g_fence、g_done 只在已提交的命令缓冲
 // 完成时推进，所以等栅栏 f 就是等「f 翻译完且 GPU 做完」——游戏按栅栏回收命令内存、改写对象时翻译线程早已读完。
@@ -868,10 +874,12 @@ static void x_run(const xjob *j, uint64_t job) {
     else if (j->kind == XJ_PRESENT) { uint64_t tk = mtl_present(j->tex, j->period, j->crop); pthread_mutex_lock(&g_xmu); g_xtk[job % XTK].job = job; g_xtk[job % XTK].tk = tk; pthread_mutex_unlock(&g_xmu); }
     else {
         mtl_set_frame(j->frame);
-        // 翻译线程与游戏主线程同级：时间约束（实时）线程，周期 = 出图周期，计算量按本线程每帧 CPU 的 p90 自动声明（同取图处的主线程；确定性时钟下不声明）
-        // The translation thread has the same standing as the game main thread: a time-constraint (real-time) thread, period = present period, computation declared automatically from the p90 of this thread's per-frame CPU (same as the main thread at acquire; not declared under the deterministic clock)
+        // 翻译线程默认不声明实时配额（DM_XLAT_RT=1 才声明）：两条线程各按 0.9 × 周期声明会合计超过一个周期。
+        // 线程本身仍是 USER_INTERACTIVE QoS，只是不再向系统预约实时算力。
+        // The translation thread does not declare real-time quota by default (only with DM_XLAT_RT=1): two threads each declaring 0.9 × period would sum past one period.
+        // The thread itself stays at USER_INTERACTIVE QoS; it just no longer reserves real-time computation from the system.
         uint64_t pn = (uint64_t)(j->period * 1e9); static uint64_t rt_p;
-        if (!g_x_sync && !dm_detclock_enabled()) { if (pn && rt_p != pn) { rt_p = pn; set_time_constraint(&g_rt_xlat, pn); } rt_comp_tick(&g_rt_xlat, pn); }
+        if (!g_x_sync && !dm_detclock_enabled() && xlat_rt_on()) { if (pn && rt_p != pn) { rt_p = pn; set_time_constraint(&g_rt_xlat, pn); } rt_comp_tick(&g_rt_xlat, pn); }
     }
 }
 static void *x_thread(void *a) {
@@ -1020,6 +1028,7 @@ static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 static uint64_t present_link_timeout(const win_t *o);
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
+__attribute__((weak)) void dm_main_block_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
 extern uint32_t mtl_present_qos(void);
 static uint64_t g_frame;
@@ -1107,7 +1116,16 @@ static void dump_frame(void) {
 // ---------- Timing instrumentation (per-frame rows written to DM_NVN_TSV: frame / @metric / value; every 300 frames a summary of p50 / p95 / max) ----------
 #define TWIN 300
 static double g_tw[8][TWIN]; static unsigned g_tn[8];
-static double g_pres_iv[TWIN]; static unsigned g_presn;   // 上屏间隔（ms；−1 = 被系统丢弃，0 = 无读数） | Present interval (ms; -1 = dropped by the system, 0 = no reading)
+static double g_pres_iv[TWIN]; static double g_pres_target_ms[TWIN]; static unsigned g_presn;   // 上屏间隔与目标周期（ms；−1 = 被系统丢弃，0 = 无读数） | Present interval and target period (ms; -1 = dropped by the system, 0 = no reading)
+static _Atomic double g_active_target_period_ms;
+static nvn_pres_latch_t g_pres_latch;
+__attribute__((weak)) void dm_log_io_roles_get(double *prod_ms, uint64_t *prod_stalls,
+                                             double *file_ms, uint64_t *file_stalls,
+                                             double *fsync_ms, uint64_t *fsync_count,
+                                             uint64_t *mirror_stalls, uint64_t *client_stalls) {
+    *prod_ms = *file_ms = *fsync_ms = 0;
+    *prod_stalls = *file_stalls = *fsync_count = *mirror_stalls = *client_stalls = 0;
+}
 __attribute__((weak)) double dm_brightness_now(void) { return -1; }
 __attribute__((weak)) void dm_perf_present(double iv_ms) { (void)iv_ms; }   // 缺省（单测）；宿主 diag.c 的强定义：常开性能记录 perf.txt | Default (unit tests); strong definition in the host's diag.c: always-on performance record perf.txt
 uint64_t dm_nvn_sub_cpu_ns(void) { return atomic_load(&g_cum_sub_cpu_ns); }   // 提交（不含出图）累计 CPU 纳秒 | Cumulative CPU nanoseconds of submit (excluding present)
@@ -1118,10 +1136,23 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 // 长帧日志的逐帧环（GPU 时间滞后 8 帧才有，所以先存后判）
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
+typedef struct {
+    uint64_t f;
+    double fr, nv, t_s, make_ms, up_mb, up_ms;
+    double comp_ms, wait_ms, learn_ms;
+    double sub_cpu_ms, main_cpu_ms;
+    double acq_wait_ms, pq_wait_ms;
+    uint64_t yield_n, block_n;
+    double yield_ms, block_ms;
+    unsigned pso, lib, up, rup;
+    unsigned comp_n, wait_n;
+    int ls;
+} lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
 static lf_rec g_lf[LFN];
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[长帧] %s", what); }   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
-extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
+extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns);
+extern void mtl_pso_breakdown(uint64_t *comp_n, uint64_t *comp_ns, uint64_t *wait_n, uint64_t *wait_ns, uint64_t *learn_n, uint64_t *learn_ns);
+extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
 static const char *const g_tname[8] = {"帧时间", "出帧工作", "NVN 提交+出图", "GPU", "翻译层录制期", "翻译层提交期", "取图节拍实际墙钟", "交换链归还等待"};
 static void tpush(int k, double v) { g_tw[k][g_tn[k]++ % TWIN] = v; }
 // 发热归因（iOS DM_HEAT）：每帧 GPU 毫秒另存一圈，取「上次取数以来」的均值 / p95（最多最近 HRN 帧），与计时汇总的 300 帧窗口互不干扰
@@ -1147,14 +1178,28 @@ static void tsummary(uint64_t frame) {
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // 帧间隔另起一行（M1 基线）：本窗口 > 16.7 ms 帧数与 p99 | frame interval gets its own line (M1 baseline): number of frames > 16.7 ms in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > 16.7;
         LOG("[nvn] 帧间隔 至帧 %llu：>16.7ms %u / %u 帧，p99 %.2f ms", frame, over, n, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
-    { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0; double v[TWIN];   // 上屏：掉帧 = 间隔 > 16.7 × 1.5 ms 或被丢弃 | on-screen present: dropped frame = interval > 16.7 × 1.5 ms or discarded
-      for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > 25.0; } }
+    { unsigned n = g_presn < TWIN ? g_presn : TWIN;
+      nvn_pres_summary_t ps;
+      double fb = atomic_load(&g_active_target_period_ms);
+      if (fb <= 0 || !isfinite(fb)) fb = 1000.0 / 60.0;
+      nvn_calc_pres_summary(g_pres_iv, g_pres_target_ms, n, fb, &ps);
       task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT; double fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS ? vi.phys_footprint / 1048576.0 : -1;
       double br = dm_brightness_now();   // footprint / 亮度随上屏行带出：不依赖拍入口观测门（营地局也有） | footprint / brightness are carried on the on-screen present row: does not depend on the tick-entry observation gate (camp runs have it too)
-      // 上屏间隔 p5 / p50 / p95：整除的帧率三个数相同（144 Hz 屏 72 帧都是 13.9）；不整除时两档交替（60 帧在 144 Hz 屏上 13.9 / 20.8）
-      // Present interval p5 / p50 / p95: with an evenly dividing frame rate all three are equal (72 fps on a 144 Hz screen is 13.9 for all); otherwise two tiers alternate (60 fps on a 144 Hz screen gives 13.9 / 20.8)
-      if (k) { qsort(v, k, sizeof *v, dcmp); LOG("[nvn] 上屏 至帧 %llu：%u 帧，掉帧 %u（丢弃 %u），间隔 p5 %.2f / p50 %.2f / p95 %.2f，p99 %.2f ms；footprint %.0f MiB；亮度 %.2f；温控 %d", frame, k + discard, drop, discard,
-          v[(k * 5) / 100], v[k / 2], v[(k * 95) / 100 < k ? (k * 95) / 100 : k - 1], v[(k * 99) / 100 < k ? (k * 99) / 100 : k - 1], fp, br, dm_thermal_now()); }
+      if (ps.valid) {
+          LOG("[nvn] 上屏 至帧 %llu：%u 帧，掉帧 %u（丢弃 %u），间隔 p5 %.2f / p50 %.2f / p95 %.2f，p99 %.2f ms；迟到未判掉帧 %u 帧（%.1f–%.1f ms 盲区）；footprint %.0f MiB；亮度 %.2f；温控 %d",
+              frame, ps.evaluated, ps.drop, ps.discard, ps.p5, ps.p50, ps.p95, ps.p99, ps.late_band, ps.drop_lim / 1.5 * 1.2, ps.drop_lim, fp, br, dm_thermal_now());
+      } else if (ps.discard) {
+          LOG("[nvn] 上屏 至帧 %llu：%u 帧，掉帧 %u（丢弃 %u），全被丢弃；footprint %.0f MiB；亮度 %.2f；温控 %d",
+              frame, ps.evaluated, ps.drop, ps.discard, fp, br, dm_thermal_now());
+      }
+      { double prod_ms = 0, file_ms = 0, fs_ms = 0;
+        uint64_t prod_stalls = 0, file_stalls = 0, fs_count = 0, mirror_stalls = 0, client_stalls = 0;
+        dm_log_io_roles_get(&prod_ms, &prod_stalls, &file_ms, &file_stalls,
+                            &fs_ms, &fs_count, &mirror_stalls, &client_stalls);
+        LOG("[日志I/O] 生产端最大 %.2f ms（>5ms %llu 次）；后台落盘最大 %.2f ms（>5ms %llu 次）；fsync 最大 %.2f ms（%llu 次）；镜像/客户端阻塞 %llu/%llu 次",
+            prod_ms, (unsigned long long)prod_stalls, file_ms, (unsigned long long)file_stalls,
+            fs_ms, (unsigned long long)fs_count, (unsigned long long)mirror_stalls, (unsigned long long)client_stalls);
+      }
       g_presn = 0; }
     { static uint64_t pi, pc, pd, pf; uint64_t ci = atomic_load(&g_cum_sub_instr), cc = atomic_load(&g_cum_sub_cpu_ns), ps_, dr_; mtl_stats(&ps_, &dr_);   // 翻译层 | translation layer
       if (pf && frame > pf && dr_ > pd) LOG("[nvn] 翻译 至帧 %llu：每次绘制 %.0f 条指令，每帧提交 %.2f M 条 / CPU %.3f ms，每帧绘制 %.0f", frame,
@@ -1164,16 +1209,26 @@ static void tsummary(uint64_t frame) {
           qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0; pthread_get_qos_class_np(pthread_self(), &qc, &rp);
           uint64_t aw = 0, ag = 0; int an = 0; void mtl_alloc_stats(uint64_t *, uint64_t *, int *); mtl_alloc_stats(&aw, &ag, &an);
           static uint64_t pyn, pyns; uint64_t yn = 0, yns = 0; dm_main_yield_stats(&yn, &yns);
+          // 拓扑探测与频率统计：保留实测主频与 hw.nperflevels 原始拓扑数值，不做能效核/性能核位置推断。
+          // Topology and frequency statistics: preserve measured clock and raw hw.nperflevels topology value, no core-location inference.
+          double ghz = cpu > 0 ? cyc / cpu : 0;
+          { static int logged; if (!logged) { logged = 1; int lv = 0; size_t ln_ = sizeof lv;
+              if (sysctlbyname("hw.nperflevels", &lv, &ln_, NULL, 0) == 0 && lv > 0)
+                  LOG("[nvn] 拓扑探测：hw.nperflevels=%d", lv);
+              else
+                  LOG("[nvn] 拓扑探测：hw.nperflevels=unknown"); } }
           LOG("[nvn] 翻译细项 至帧 %llu：每帧提交 周期 %.2f M（每条指令 %.2f 周期）、CPU %.3f ms 其中内核态 %.3f ms、墙钟 %.3f ms；平均主频 %.2f GHz（周期 / CPU 时间）；本线程 QoS %#x；分配器池 %d 个、累计等 GPU %llu 次；实时声明计算 %.2f ms；主线程让出 每帧 %.0f 次 / %.3f ms", frame,
-              cyc / 1e6 / nf, cyc / (double)(ci - pi), cpu / 1e6 / nf, (double)(ck - pk) / 1e6 / nf, (double)(cw - pw) / 1e6 / nf, cpu > 0 ? cyc / cpu : 0, (unsigned)qc, an, (unsigned long long)aw, g_rt_main.comp_ms, (double)(yn - pyn) / nf, (double)(yns - pyns) / 1e6 / nf); pyn = yn; pyns = yns; }
+              cyc / 1e6 / nf, cyc / (double)(ci - pi), cpu / 1e6 / nf, (double)(ck - pk) / 1e6 / nf, (double)(cw - pw) / 1e6 / nf, ghz,
+              (unsigned)qc, an, (unsigned long long)aw, g_rt_main.comp_ms, (double)(yn - pyn) / nf, (double)(yns - pyns) / 1e6 / nf); pyn = yn; pyns = yns; }
         if (frame % 300 == 0) { unsigned wn = 0; uint32_t wq = dm_guest_work_qos(&wn); thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT; int okx = thread_info(pthread_mach_thread_np(pthread_self()), THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc) == KERN_SUCCESS;
             thread_time_constraint_policy_data_t tp; mach_msg_type_number_t tc = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t def = 0; int rt_live = thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tp, &tc, &def) == KERN_SUCCESS && !def;   // def = 1：实时策略没在生效（没设上 / 被撤） | def = 1: the real-time policy is not in effect (never set / revoked)
             LOG("[nvn] 线程策略：主线程 实时 计算 %.2f ms / 周期 %.2f ms，实时策略%s，当前优先级 %d（基础 %d，调度类 %d）；工作线程 %u 条 QoS %#x；出图 QoS %#x", g_rt_main.comp_ms, g_rt_main.period_ms, rt_live ? "在生效" : "未生效", okx ? xi.pth_curpri : -1, okx ? xi.pth_priority : -1, okx ? xi.pth_policy : -1, wn, wq, mtl_present_qos());
-            if (g_x_port) {   // 翻译线程：声明、实时策略在不在生效、当前 / 基础优先级、QoS（降级看这几项；在不在大核看「翻译细项」行的平均主频） | Translation thread: declaration, whether the real-time policy is in effect, current / base priority, QoS (check these for demotion; for whether it is on a performance core, see the average clock on the "translation detail" line)
+            if (g_x_port) {   // 翻译线程：声明、实时策略在不在生效、当前 / 基础优先级、QoS（降级看这几项；主频看「翻译细项」行的平均主频） | Translation thread: declaration, whether the real-time policy is in effect, current / base priority, QoS (check these for demotion; for frequency, see the average clock on the "translation detail" line)
                 thread_extended_info_data_t yi; mach_msg_type_number_t yc = THREAD_EXTENDED_INFO_COUNT; int oky = thread_info(g_x_port, THREAD_EXTENDED_INFO, (thread_info_t)&yi, &yc) == KERN_SUCCESS;
                 thread_time_constraint_policy_data_t yp; mach_msg_type_number_t ytc = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t ydef = 0; int y_live = thread_policy_get(g_x_port, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&yp, &ytc, &ydef) == KERN_SUCCESS && !ydef;
                 qos_class_t yq = QOS_CLASS_UNSPECIFIED; int yr = 0; pthread_get_qos_class_np(g_x_thr, &yq, &yr);
-                LOG("[nvn] 线程策略：翻译线程 实时 计算 %.2f ms / 周期 %.2f ms，实时策略%s，当前优先级 %d（基础 %d，调度类 %d）；QoS %#x", g_rt_xlat.comp_ms, g_rt_xlat.period_ms, y_live ? "在生效" : "未生效",
+                LOG("[nvn] 线程策略：翻译线程 %s，实时 计算 %.2f ms / 周期 %.2f ms，实时策略%s，当前优先级 %d（基础 %d，调度类 %d）；QoS %#x",
+                    xlat_rt_on() ? "实时声明" : "不声明实时配额", g_rt_xlat.comp_ms, g_rt_xlat.period_ms, y_live ? "在生效" : "未生效",
                     oky ? yi.pth_curpri : -1, oky ? yi.pth_priority : -1, oky ? yi.pth_policy : -1, (unsigned)yq); } }
         py = cy; pk = ck; pw = cw; }
       pi = ci; pc = cc; pd = dr_; pf = frame; }
@@ -1241,6 +1296,13 @@ static void set_time_constraint_comp(rt_decl *d, uint64_t period_ns, uint64_t co
     LOG("[nvn] %s时间约束策略（周期 %.3f ms、计算 %.3f ms）%s", d->who, period_ns / 1e6, comp_ns / 1e6, kr == KERN_SUCCESS ? "已设" : "设置失败");
 }
 static int rt_comp_fixed_ms(void) { static int v = -2; if (v == -2) { const char *e = getenv("DM_RT_COMP"); v = e && *e && strcmp(e, "auto") ? atoi(e) : -1; } return v; }   // −1 = auto
+// 翻译线程是否也参与实时配额：缺省不参与。主线程与翻译线程各自按 0.9 × 周期声明时，两者相加可达 1.8 × 周期，
+// 系统无法同时满足两个实时线程的期限。翻译线程保留 USER_INTERACTIVE QoS 与基础优先级，只是不再声明时间约束。
+// DM_XLAT_RT=1 恢复旧行为（对照实验用）。 | Whether the translation thread also takes part in real-time quota: by default it does not.
+// When main and translation each declare 0.9 × period, the sum can reach 1.8 × period and the system cannot honour both deadlines.
+// The translation thread keeps USER_INTERACTIVE QoS and its base priority; it simply stops declaring a time constraint.
+// DM_XLAT_RT=1 restores the old behaviour (for A/B comparison).
+static int xlat_rt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_XLAT_RT"); v = e && atoi(e); } return v; }
 static void set_time_constraint(rt_decl *d, uint64_t period_ns) {
     int f = rt_comp_fixed_ms();
     // A30/60 switch changes the deadline, not the learned amount of CPU work.
@@ -1301,16 +1363,20 @@ static uint64_t present_period(const win_t *o) {
     int itv = g_display_mode ? 1 : o->interval > 0 ? o->interval : 1; double hz = g_hz_auto ? mtl_pace_hz() : g_hz;   // 30帧的线程声明、交换链后备周期与真实生产目标一致；60帧不变 | Match RT/swapchain period to actual eco target; keep 60fps unchanged
     return hz > 0 ? (uint64_t)(itv * 1e9 / hz) : 0;
 }
-// Drawable service is still60Hz in eco. Do not double the old callback timeout
-// merely because the render/RT period is now correctly33.33ms.
+// CAMetalDisplayLink 等待超时：调用 nvn_pace.h 中的统一纯算式，留足 100% 安全余量（2 * period）
+// 避免运行循环调度抖动（0.01~5ms）引发 30 帧下假超时与节拍丢失
 static uint64_t present_link_timeout(const win_t *o) {
     uint64_t period = present_period(o);
     double service = g_hz_auto ? dm_pace_hz(mtl_display_refresh(), 60) : 0;
-    return service > 0 ? (uint64_t)(2e9 / service) : period ? 2 * period : 33333333ull;
+    return nvn_link_timeout_ns(period, service);
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++; o->present_jobs[o->presents % 16] = 0;
+    uint64_t enq_period = present_period(o);
+    double enq_target_ms = enq_period > 0 ? (enq_period / 1e6) : (1000.0 / 60.0);
+    nvn_pres_latch_record(&g_pres_latch, o->presents, enq_target_ms);
+    atomic_store(&g_active_target_period_ms, enq_target_ms);
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     // 第一次进局的读取画面：后台管线预热没跑完就在这里等它（读取画面多停一会儿），进局后不在提交线程现编管线。预热早已完成时一次判断即过
     // Loading screen on first entering a run: if the background pipeline warm-up has not finished, wait for it here (the loading screen stays a bit longer), so that after entering the run no pipelines are compiled on the fly on the submit thread. When warm-up finished long ago this passes with a single check
@@ -1386,28 +1452,71 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         // Accounting: number of synchronous creations on the submit thread this frame + a timestamp on the same clock as UIMSG (offline, frames are split into front end / loading / in-run by the loading screen intervals)
         static uint64_t plib, ppso; uint64_t lib_, pso_; mtl_create_stats(&lib_, &pso_);
         trow(f, "@lib_new", (double)(lib_ - plib)); trow(f, "@pso_new", (double)(pso_ - ppso));
+        uint64_t sub_cpu_val = atomic_exchange(&g_sub_cpu_ns, 0);
         {   // 长帧日志：本帧各项先记进环，等 8 帧后 GPU 时间到了再决定打不打（见下） | long-frame log: this frame's items are first recorded into the ring; whether to print is decided 8 frames later, once the GPU time has arrived (see below)
-            static uint64_t plns, ppns, pup, prup, pub; uint64_t lns, pns, up, rup, ub; mtl_create_ns(&lns, &pns); mtl_pkg_stats(&up, &rup); ub = mtl_upload_bytes();
+            static uint64_t plns, ppns, pup, prup, pub;
+            static uint64_t pcomp_n, pcomp_ns, pwait_n, pwait_ns, plearn_ns;
+            static uint64_t prev_main_c;
+            static uint64_t prev_yield_n, prev_yield_ns, prev_block_n, prev_block_ns;
+            uint64_t cur_main_c = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+            double cur_main_cpu = prev_main_c ? (double)(cur_main_c - prev_main_c) / 1e6 : 0.0;
+            prev_main_c = cur_main_c;
+            uint64_t lns = 0, pns = 0, up = 0, rup = 0, ub = 0;
+            uint64_t comp_n = 0, comp_ns = 0, wait_n = 0, wait_ns = 0, learn_n = 0, learn_ns = 0;
+            mtl_create_ns(&lns, &pns);
+            mtl_pso_breakdown(&comp_n, &comp_ns, &wait_n, &wait_ns, &learn_n, &learn_ns);
+            mtl_pkg_stats(&up, &rup); ub = mtl_upload_bytes();
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->ls = g_nvn_loadscreen_up ? g_nvn_loadscreen_up() : 0; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
+            r->comp_n = (unsigned)(comp_n - pcomp_n);
+            r->comp_ms = (double)(comp_ns - pcomp_ns) / 1e6;
+            r->wait_n = (unsigned)(wait_n - pwait_n);
+            r->wait_ms = (double)(wait_ns - pwait_ns) / 1e6;
+            r->learn_ms = (double)(learn_ns - plearn_ns) / 1e6;
+            r->main_cpu_ms = cur_main_cpu;
+            r->sub_cpu_ms = (double)sub_cpu_val / 1e6;
+            r->acq_wait_ms = (double)g_acq_wait_ns / 1e6;
+            r->pq_wait_ms = (double)g_pq_wait_ns / 1e6;
+            uint64_t yn = 0, yns = 0, bn = 0, bns = 0;
+            dm_main_yield_stats(&yn, &yns); dm_main_block_stats(&bn, &bns);
+            r->yield_n = yn - prev_yield_n; r->yield_ms = (yns - prev_yield_ns) / 1e6;
+            r->block_n = bn - prev_block_n; r->block_ms = (bns - prev_block_ns) / 1e6;
+            prev_yield_n = yn; prev_yield_ns = yns; prev_block_n = bn; prev_block_ns = bns;
+            DM_MOTION(DM_MOTION_FRAME, f, 0, fr, cur_main_cpu, r->sub_cpu_ms,
+                      r->acq_wait_ms, r->pq_wait_ms, enq_target_ms, r->ls,
+                      dm_3d_scale_cur ? dm_3d_scale_cur() : -1, r->comp_n, r->comp_ms, r->up_ms);
             plns = lns; ppns = pns; pup = up; prup = rup; pub = ub;
+            pcomp_n = comp_n; pcomp_ns = comp_ns; pwait_n = wait_n; pwait_ns = wait_ns; plearn_ns = learn_ns;
         }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
+        { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); trow(f, "@mono_s", ts.tv_sec + ts.tv_nsec / 1e9); }
+        { static uint64_t pw, pk; uint64_t w, k; void dm_hle_wake_counts(uint64_t *, uint64_t *); dm_hle_wake_counts(&w, &k); trow(f, "@wakes", (double)(w - pw)); trow(f, "@wake_skips", (double)(k - pk)); pw = w; pk = k; }
         trow(f, "@drawable_ms", mtl_drawable_ns_take() / 1e6);
-        trow(f, "@sub_wall_ms", atomic_exchange(&g_sub_wall_ns, 0) / 1e6); trow(f, "@sub_cpu_ms", atomic_exchange(&g_sub_cpu_ns, 0) / 1e6); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
+        trow(f, "@sub_wall_ms", atomic_exchange(&g_sub_wall_ns, 0) / 1e6); trow(f, "@sub_cpu_ms", (double)sub_cpu_val / 1e6); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
     } else atomic_store(&g_nvn_ns, 0);
     g_acq_wait_ns = g_pq_wait_ns = 0;
     if (f >= 8) { double g = mtl_gpu_ms(f - 8); if (g >= 0) { tpush(3, g); trow(f - 8, "@gpu_ms", g); g_hr[g_hn++ % HRN] = g; }   // GPU 时间滞后 8 帧取（已完成） | GPU time is taken 8 frames late (already completed)
+        if (g >= 0) { uint64_t begin = 0, end = 0; int span = mtl_gpu_span(f - 8, &begin, &end);
+            DM_MOTION(DM_MOTION_GPU, f - 8, 0, g, span ? begin / 1e9 : -1, span ? end / 1e9 : -1); }
         { lf_rec *r = &g_lf[(f - 8) % LFN];   // 长帧日志（缺省开，DM_LONGFRAME=0 关）：整帧 > 20 ms 或 GPU > 16.7 ms、且明显高于近况，才打一行 | long-frame log (on by default, DM_LONGFRAME=0 turns it off): a line is printed only when the whole frame > 20 ms or GPU > 16.7 ms, and it is clearly above recent conditions
           static int on = -1; if (on < 0) { const char *e = getenv("DM_LONGFRAME"); on = !(e && !strcmp(e, "0")); }
           // 「长」是相对近况说的：稳定跑在 30 帧（菜单 / 无窗口宿主）或持续过载时每帧都 > 20 ms，那不是长帧，不刷屏——要比近 16 帧的滑动均值高出四成才算
           // "Long" is relative to recent conditions: when running steadily at 30 fps (menus / windowless host) or under sustained overload, every frame is > 20 ms; those are not long frames and must not flood the log - a frame has to be 40% above the sliding mean of the last 16 frames to count
           static double ef = 16.7, eg = 8; int lf = r->fr > 20.0 && r->fr > 1.4 * ef, lg = g > 16.7 && g > 1.3 * eg;
           if (r->f == f - 8) { ef += ((r->fr < 3 * ef ? r->fr : 3 * ef) - ef) / 16; eg += ((g < 3 * eg ? g : 3 * eg) - eg) / 16; }
-          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[512];
-              snprintf(b, sizeof b, "帧 %llu（%.2f s）整帧 %.1f ms，提交+出图 %.1f ms，GPU %.1f ms；新建管线 %u 条 + 着色器库 %u 个共 %.1f ms；上传贴图 首传 %u 张 + 重传 %u 次 %.1f MB / %.1f ms",
-                       (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms);
+          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[640];
+              if (r->make_ms > 0.05 || r->comp_n > 0 || r->wait_n > 0) {
+                  snprintf(b, sizeof b, "帧 %llu（%.2f s）整帧 %.1f ms（主线程CPU %.1f ms，翻译CPU %.1f ms，节拍等 %.1f ms，出图队等 %.1f ms），提交+出图 %.1f ms，GPU %.1f ms；管线新建 %.1f ms（新编 %u 条/%.1f ms + 预测等 %.1f ms + 学习写盘 %.1f ms）+ 着色器库 %u 个；上传贴图 首传 %u 张 + 重传 %u 次 %.1f MB / %.1f ms",
+                           (unsigned long long)r->f, r->t_s, r->fr, r->main_cpu_ms, r->sub_cpu_ms, r->acq_wait_ms, r->pq_wait_ms, r->nv, g, r->make_ms, r->comp_n, r->comp_ms, r->wait_ms, r->learn_ms, r->lib, r->up, r->rup, r->up_mb, r->up_ms);
+              } else {
+                  snprintf(b, sizeof b, "帧 %llu（%.2f s）整帧 %.1f ms（主线程CPU %.1f ms，翻译CPU %.1f ms，节拍等 %.1f ms，出图队等 %.1f ms），提交+出图 %.1f ms，GPU %.1f ms；新建管线 0 条 + 着色器库 %u 个共 0.0 ms；上传贴图 首传 %u 张 + 重传 %u 次 %.1f MB / %.1f ms",
+                           (unsigned long long)r->f, r->t_s, r->fr, r->main_cpu_ms, r->sub_cpu_ms, r->acq_wait_ms, r->pq_wait_ms, r->nv, g, r->lib, r->up, r->rup, r->up_mb, r->up_ms);
+              }
+              size_t used = strlen(b);
+              snprintf(b + used, sizeof b - used, "；主线程让出 %llu 次/%.1f ms，客体同步等 %llu 次/%.1f ms",
+                       (unsigned long long)r->yield_n, r->yield_ms, (unsigned long long)r->block_n, r->block_ms);
+              if (!lf) strlcat(b, "；整帧不长，GPU 长", sizeof b);
               // 可见性：长帧「晚出来」的那段时间屏幕上停着的是上一帧；上一帧若是读取画面（或本帧自己就是），玩家看到的只是读取画面多停了一下，没有运动被打断
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
@@ -1432,7 +1541,11 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // Actual presentation interval (windowed mode): taken 8 presents late (the presented callback has arrived by then), as the difference between the n-th and the (n−1)-th; −1 = discarded
     if (o->presents > 9) { uint64_t n = o->presents - 8; double a_, b_; x_present_samples(o, n, &a_, &b_);
         if (a_ < 0) trow(f - 8, "@presented_ms", -1); else if (a_ > 0 && b_ > 0) trow(f - 8, "@presented_ms", (a_ - b_) * 1e3);
-        g_pres_iv[g_presn++ % TWIN] = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0);
+        double cur_target_ms = period > 0 ? (period / 1e6) : (1000.0 / 60.0);
+        double hist_target_ms = nvn_pres_latch_get(&g_pres_latch, n, cur_target_ms);
+        unsigned pidx = g_presn++ % TWIN;
+        g_pres_iv[pidx] = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0);
+        g_pres_target_ms[pidx] = hist_target_ms;
         { double iv_ = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0); mtl_ub_present(iv_); }   // 同进程交替测量（DM_NVN_UB）按相统计上屏间隔；没开时只是一次原子读 | same-process alternating measurement (DM_NVN_UB) tallies on-screen present intervals per phase; when off it is just one atomic read
         dm_perf_present(a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0));   // 上屏间隔另存一圈，tsummary 每 300 帧报掉帧（M1 判据） | on-screen present intervals are also kept in a separate ring; tsummary reports dropped frames every 300 frames (M1 criterion)
         if (a_ > 0) trow(f - 8, "@pres_at_ms", a_ * 1e3 - g_t0_ns / 1e6); }   // 上屏时刻（进程起点 ms；presentedTime 与 mach_absolute_time 同基） | on-screen present time (ms since process start; presentedTime shares a time base with mach_absolute_time)

@@ -51,6 +51,25 @@ int main(void) { @autoreleasepool {
                 if (w[k].dtt >= 0) { snprintf(m, sizeof m, "B 绑定[%d] 哑贴图类型", w[k].i); check(m, w[k].dtt, g->dtt);
                                      snprintf(m, sizeof m, "B 绑定[%d] 哑贴图像素类", w[k].i); check(m, w[k].dpf, g->dpf); }
             }
+            // 驱动段精确读取偏移（热路径按它只填被读槽）：json 原文 c0 = [1376]，c2 = [592, 1392]
+            // Precise driver-segment read offsets (the hot path fills only the read slots from them): json text c0 = [1376], c2 = [592, 1392]
+            check("B 片元：读驱动段 c0", 1, r.drv_read[0]); check("B 片元：读驱动段 c2", 1, r.drv_read[2]);
+            check("B 片元：c0 读取偏移数", 1, r.drv_noff[0]); check("B 片元：c0 偏移[0] = 1376", 1376, r.drv_off[0][0]);
+            check("B 片元：c2 读取偏移数", 2, r.drv_noff[2]);
+            check("B 片元：c2 偏移[0] = 592", 592, r.drv_off[2][0]); check("B 片元：c2 偏移[1] = 1392", 1392, r.drv_off[2][1]);
+            {   nvn_refl bad; char e2[160] = "";   // 负对照：动态下标 / 越界偏移 / 超上限都必须报红 | Negative controls: dynamic index / out-of-range offset / over-limit must all fail
+                NSDictionary *dyn = @{@"route": @"B", @"bindings": @[], @"drv_reads": @{@"2": @{@"vec4_offsets": @[@592], @"dynamic": @YES}}};
+                check("驱动段动态下标被拒", 1, nvn_refl_from_json(dyn, &bad, e2, sizeof e2) != 0);
+                NSDictionary *oor = @{@"route": @"B", @"bindings": @[], @"drv_reads": @{@"2": @{@"vec4_offsets": @[@4096], @"dynamic": @NO}}};
+                check("驱动段偏移越界被拒", 1, nvn_refl_from_json(oor, &bad, e2, sizeof e2) != 0);
+                NSDictionary *mis = @{@"route": @"B", @"bindings": @[], @"drv_reads": @{@"0": @{@"vec4_offsets": @[@1370], @"dynamic": @NO}}};
+                check("驱动段偏移不在 16 字节边界被拒", 1, nvn_refl_from_json(mis, &bad, e2, sizeof e2) != 0);
+                NSMutableArray *many = [NSMutableArray array]; for (int i = 0; i < 11; i++) [many addObject:@(i * 16)];
+                NSDictionary *over = @{@"route": @"B", @"bindings": @[], @"drv_reads": @{@"2": @{@"vec4_offsets": many, @"dynamic": @NO}}};
+                check("驱动段偏移超上限被拒", 1, nvn_refl_from_json(over, &bad, e2, sizeof e2) != 0);
+                NSDictionary *nods = @{@"route": @"B", @"bindings": @[]};   // 旧 json 无偏移记录：合法，drv_noff 为 0 走整表回退 | Old json without offsets: legal, drv_noff 0 → full-fill fallback
+                check("无驱动段记录的旧 json 仍可加载", 0, nvn_refl_from_json(nods, &bad, e2, sizeof e2));
+            }
             printf("%-60s %s\n", "B 片元 ps_models_p#0：44 个绑定（含 support / c1 / 驱动段 / 存储缓冲指针）", fail == f1 ? "✓" : "✗");
         } }
     {   NSDictionary *j = load("54f730a6c0efc118_b");

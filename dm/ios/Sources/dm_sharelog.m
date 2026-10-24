@@ -3,14 +3,14 @@
 // 宿主收到这条空操作消息后调这里登记的回调（dm/host/diag.c）。这里做两件：
 //   ① 打一个文件：头部（构建号、机型、系统版本、温控 / 电量 / 内存 / 存储、本局与上一局的关键性能读数）+ 本局 boot.txt + 上一局 boot.previous.txt（main.m 每次启动前改名留下）；
 //   ② 弹系统分享面板（UIActivityViewController），玩家自己选发到哪；iPad / Mac 上分享面板是弹出框，必须给锚点，否则一弹就崩。
-// 隐私：只放这两份日志（游戏与宿主自己写的）和上面那几项机器读数；不取设备名、不取任何账号 / 位置 / 通讯录类信息。
+// 隐私：仅导出游戏/宿主诊断、测量记录及用户管线清单；不取设备名、账号、位置或通讯录。
 // 测试开关 DM_TEST_SHARELOG_CLOSE=<秒>：分享面板照常弹出，过这么多秒自动收起；导出的文件另拷一份到 Documents/sharelog_test.txt 供回归核内容。
 // iOS side of the pause menu's 「分享诊断日志」(Share Diagnostics).
 // The button is the game's own widget (layout: _pause_no_help in tools/touch_layout.py: borrows the original game's 「消息记录」(Message Log) button, changes the text, and makes it send PanelManager:ClosePanel:TouchShareLog instead),
 // and on receiving this no-op message the host calls the callback registered here (dm/host/diag.c). Two things are done here:
 //   ① Build one file: header (build number, device model, OS version, thermal / battery / memory / storage, key performance readings of this run and the previous run) + this run's boot.txt + the previous run's boot.previous.txt (left by main.m's rename before each launch);
 //   ② Present the system share sheet (UIActivityViewController), and the player chooses where to send it; on iPad / Mac the share sheet is a popover and must be given an anchor, otherwise it crashes as soon as it is presented.
-// Privacy: only these two logs (written by the game and the host themselves) and the machine readings listed above are included; no device name, no account / location / contacts information of any kind.
+// Privacy: exports game/host diagnostics, measurements and the learned pipeline manifest; no device name, account, location or contacts.
 // Test switch DM_TEST_SHARELOG_CLOSE=<seconds>: the share sheet is presented as usual and dismissed automatically after that many seconds; the exported file is also copied to Documents/sharelog_test.txt so regression can check its content.
 #import <UIKit/UIKit.h>
 #include <stdatomic.h>
@@ -19,6 +19,8 @@
 #include <unistd.h>
 #include "../../host/dm_i18n.h"
 #include "dm_measurement.h"
+#include "../../host/dm_motion.h"
+#include "dm_log_ring.h"
 void plog(const char *fmt, ...);
 void dm_sharelog_init(void (*cb)(void));   // dm/host/diag.c
 
@@ -49,7 +51,41 @@ static NSData *scrub_home(NSData *d) {
     [o appendBytes:b + from length:n - from]; return o;
 }
 static NSDate *g_t0;   // 本次启动时刻（dm_sharelog_boot） | Time of this launch (dm_sharelog_boot)
+static NSData *motion_timeline(void) {
+    dm_motion_row *motion = malloc(sizeof(*motion) * DM_MOTION_CAPACITY);
+    dm_motion_stats motion_stats = {0};
+    size_t motion_count = dm_motion_snapshot(motion, motion ? DM_MOTION_CAPACITY : 0, &motion_stats);
+    NSMutableString *timeline = [NSMutableString stringWithFormat:
+        @"motion_schema=1 capacity=%u accepted=%llu overwritten=%llu contended=%llu exported=%zu allocation_ok=%d\n"
+         "time_ns=host_monotonic; frame=guest_frame; ticket=present_queue_ticket; unavailable_rows_are_not_zero_measurements\n"
+         "input: sampling,buttons,lx,ly,rx,ry,attributes\n"
+         "client: unit_id,unit_mode,x,y,error_x,error_y,moving,tau,ticks,dx,dy; coordinates=1/65536_tile\n"
+         "yaw: unit_id,body_radians,smoothed_radians\n"
+         "frame: total_ms,main_cpu_ms,translation_cpu_ms,acquire_wait_ms,present_queue_wait_ms,target_period_ms,loading,scale,compile_count,compile_ms,upload_ms\n"
+         "gpu: sum_ms,begin_host_s,end_host_s\n"
+         "enqueue: enqueue_media_s,period_s\n"
+         "display: presented_media_s,target_media_s,period_s; presented<=0 means invalid\n"
+         "camera: current_vp[12,13,14,15,0,1,2,4,5,6],previous_vp[12,13]; cb3_offsets=336,464; pending_writes_omitted\n"
+         "sequence\ttime_ns\tframe\tticket\tevent\tv0\tv1\tv2\tv3\tv4\tv5\tv6\tv7\tv8\tv9\tv10\tv11\n",
+        DM_MOTION_CAPACITY, (unsigned long long)motion_stats.accepted,
+        (unsigned long long)motion_stats.overwritten, (unsigned long long)motion_stats.contended,
+        motion_count, motion != NULL];
+    static const char *motion_names[] = {"unknown", "input", "client", "yaw", "frame", "gpu", "enqueue", "display", "camera"};
+    for (size_t i = 0; i < motion_count; i++) {
+        const dm_motion_row *r = &motion[i];
+        [timeline appendFormat:@"%llu\t%llu\t%llu\t%llu\t%s", (unsigned long long)r->sequence,
+            (unsigned long long)r->time_ns, (unsigned long long)r->frame, (unsigned long long)r->ticket,
+            r->event < sizeof(motion_names) / sizeof(*motion_names) ? motion_names[r->event] : "unknown"];
+        for (unsigned j = 0; j < DM_MOTION_VALUES; j++) [timeline appendFormat:@"\t%.17g", r->value[j]];
+        [timeline appendString:@"\n"];
+    }
+    free(motion);
+    return [timeline dataUsingEncoding:NSUTF8StringEncoding];
+}
 static NSURL *build_file(void) {
+    extern void mtl_pso_user_drain(void);
+    int log_flush_result = dm_log_flush(500);   // Export worker only; frame producers never wait for disk.
+    mtl_pso_user_drain();
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
     NSData *(^rd)(NSString *) = ^NSData *(NSString *n) { return [NSData dataWithContentsOfFile:[doc stringByAppendingPathComponent:n] options:NSDataReadingMappedIfSafe error:nil]; };   // 映射着读：日志没有字节封顶，整读进内存再拼、再洗各拷一遍，峰值是日志的四倍 | read through a mapping: the log has no byte cap, and reading it whole into memory, then joining and scrubbing with one copy each, peaks at four times the log size
@@ -68,6 +104,31 @@ static NSURL *build_file(void) {
     [h appendFormat:@"D2R Mobile Diagnostics\n导出时间 %@\n版本 %@ 构建 %@\n机型 %s 系统 %@\n", [df stringFromDate:NSDate.date], [inf[@"CFBundleShortVersionString"] description] ?: @"未知", build, hw, pi.operatingSystemVersionString];
     [h appendFormat:@"温控档位 %ld 低电量模式 %@ 电量 %.0f%% %@\n", (long)pi.thermalState, pi.lowPowerModeEnabled ? @"开" : @"关", dev.batteryLevel < 0 ? -1.0 : dev.batteryLevel * 100, bs >= 0 && bs <= 3 ? bst[bs] : @"未知"];   // 中文一律走 %@：NSString 的 %s 不按 UTF-8 解 | Chinese always goes through %@: NSString's %s does not decode as UTF-8
     [h appendFormat:@"物理内存 %.1f GB 可用存储 %.1f GB 本次已运行 %.0f 分钟\n", pi.physicalMemory / 1073741824.0, [fsa[NSFileSystemFreeSize] doubleValue] / 1073741824.0, -g_t0.timeIntervalSinceNow / 60];
+    double p_max = 0, f_max = 0, fs_max = 0;
+    uint64_t p_stalls = 0, f_stalls = 0, fs_count = 0, m_stalls = 0, c_stalls = 0;
+    extern void dm_log_io_roles_get(double *prod_max_ms, uint64_t *prod_stalls,
+                                    double *file_max_ms, uint64_t *file_stalls,
+                                    double *fsync_max_ms, uint64_t *fsync_count,
+                                    uint64_t *mirror_stalls, uint64_t *client_stalls);
+    dm_log_io_roles_get(&p_max, &p_stalls, &f_max, &f_stalls, &fs_max, &fs_count, &m_stalls, &c_stalls);
+    uint64_t pso_att = 0, pso_acc = 0, pso_wrt = 0, pso_drp = 0, pso_fail = 0;
+    extern void mtl_pso_user_stats(uint64_t *attempted, uint64_t *accepted, uint64_t *written, uint64_t *dropped, uint64_t *failed);
+    mtl_pso_user_stats(&pso_att, &pso_acc, &pso_wrt, &pso_drp, &pso_fail);
+    [h appendFormat:@"日志I/O 生产端写管道最大 %.2f ms（阻塞>5ms: %llu 次） 文件落盘最大 %.2f ms（阻塞: %llu 次） fsync最大 %.2f ms（%llu 次） 清单尝试/接受/写/丢/败: %llu/%llu/%llu/%llu/%llu\n",
+     p_max, (unsigned long long)p_stalls, f_max, (unsigned long long)f_stalls, fs_max, (unsigned long long)fs_count,
+    (unsigned long long)pso_att, (unsigned long long)pso_acc, (unsigned long long)pso_wrt, (unsigned long long)pso_drp, (unsigned long long)pso_fail];
+    extern void dm_main_yield_stats_v2(uint64_t *n, uint64_t *ns, uint64_t *backoff_n);
+    uint64_t y_n = 0, y_ns = 0, y_bo = 0;
+    dm_main_yield_stats_v2(&y_n, &y_ns, &y_bo);
+    [h appendFormat:@"主线程调度 让出总计 %llu 次（耗时 %.2f ms，自适应退避 %llu 次）\n",
+        (unsigned long long)y_n, y_ns / 1e6, (unsigned long long)y_bo];
+    dm_log_buffer_stats_t log_stats; dm_log_buffer_stats_get(&log_stats);
+    [h appendFormat:@"日志缓冲 ready=%u startup_errno=%u capacity=%llu queued=%llu high_water=%llu accepted=%llu dropped=%llu bytes; contention/overflow/oversize/unavailable=%llu/%llu/%llu/%llu; producer_max=%.3f ms; completed=%llu durable=%llu file_errors=%llu fsync_errors=%llu flush=%d（仅已接受内存字节，原始fd2管道未纳入）\n",
+        log_stats.worker_ready, log_stats.startup_errno, log_stats.capacity_bytes, log_stats.queued_bytes,
+        log_stats.high_water_bytes, log_stats.accepted_bytes, log_stats.dropped_bytes,
+        log_stats.contention_drops, log_stats.overflow_drops, log_stats.oversize_drops, log_stats.unavailable_drops,
+        log_stats.producer_max_ns / 1e6, log_stats.completed_bytes, log_stats.durable_bytes,
+        log_stats.file_errors, log_stats.fsync_errors, log_flush_result];
     perf_block(h, @"本局关键读数（各取最后一条）", cur);
     perf_block(h, @"上一局关键读数（各取最后一条）", prev);
     NSMutableData *out = [[h dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
@@ -76,6 +137,8 @@ static NSURL *build_file(void) {
         if (d) [out appendData:d]; };
     part(blank?@"本局日志 blank.txt":@"本局日志 boot.txt", cur); part(@"上一局日志 boot.previous.txt", prev);
     part(@"测量会话 measurement_current.json",manifest);
+    part(@"移动关联 motion_timeline.tsv", motion_timeline());
+    part(@"用户管线清单 pso_user.tsv", rd(@"pso_user.tsv"));
     for(NSDictionary *item in dm_measurement_snapshot(doc,8*1024*1024)) {
         NSMutableDictionary *meta=[item mutableCopy];NSData *data=meta[@"data"];[meta removeObjectForKey:@"data"];
         NSData *md=[NSJSONSerialization dataWithJSONObject:meta options:NSJSONWritingSortedKeys error:nil];

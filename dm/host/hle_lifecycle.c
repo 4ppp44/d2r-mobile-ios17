@@ -12,6 +12,7 @@
 void tact_prefetch_stop(void);
 void granny_prof_dump(void);
 void hlecount_flush(void);
+extern int dm_log_flush(unsigned timeout_ms) __attribute__((weak_import));
 void dm_host_shutdown(const char *why) {
     static _Atomic int once; if (atomic_exchange(&once, 1)) return;
     uint64_t t0 = now_ns(); LOG("收到 %s：优雅退出", why);
@@ -23,6 +24,7 @@ void dm_host_shutdown(const char *why) {
     dm_audio_suspend(1);
     dm_gfx_suspend(1);
     LOG("优雅退出完成（%.3f 秒）", (now_ns() - t0) / 1e9);
+    if (dm_log_flush) dm_log_flush(500);   // Shutdown only; preserve the existing 1.5-second exit watchdog.
     _exit(0);
 }
 void dm_term_install(void) {

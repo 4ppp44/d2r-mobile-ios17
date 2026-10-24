@@ -1,6 +1,6 @@
 #include "dm_power_profile.h"
-// dm iOS 宿主 App。启动参数 -mode <名> 选要跑的内容；日志逐行写 Documents/<名>.txt 并 fsync，进程被杀也留得下。
-// dm iOS host App. The launch argument -mode <name> selects what to run; the log is written line by line to Documents/<name>.txt with fsync, so it survives even if the process is killed.
+// dm iOS 宿主 App。日志经有界内存队列交给后台线程写入并 fsync；溢出会计数。
+// Logs enter a bounded memory queue; one background writer persists them with fsync and counts any loss.
 #import <UIKit/UIKit.h>
 #include <sys/resource.h>
 static int g_nofile_was, g_nofile_now;   // 启动时的文件描述符软上限（原值 / 现值），开日志后记一行 | File descriptor soft limit at launch (old / new value); one line is logged after the log opens
@@ -28,6 +28,8 @@ void dm_host_shutdown(const char *why);   // 宿主优雅退出（dm/host/hle_li
 #include "../../host/romfs_validate.h"
 #include "../../host/dm_i18n.h"
 #include "dm_measurement.h"
+#define DM_LOG_RING_IMPLEMENTATION
+#include "dm_log_ring.h"
 static NSString *T(const char *k) { return @(dm_ui(k)); }   // 我们自己的界面文字（中英表 dm/i18n/ui_text.tsv，语言跟原版设置走） | our own UI text (Chinese-English string table dm/i18n/ui_text.tsv, language follows the original game's setting)
 #import <Network/Network.h>
 #include "dm_metal_cache_guard.h"
@@ -36,7 +38,7 @@ static NSString *g_mode;
 static NSString *g_measurement_profile;static BOOL g_measurement_started;
 
 static int g_log = -1;
-static int g_log_tee;
+static int g_log_started;
 static int g_log_stderr = -1;
 static int g_log_pipe[2] = {-1, -1};
 static pthread_t g_log_thread;
@@ -105,15 +107,84 @@ static void metal_cache_report_and_clean(void) {
     plog("METALCACHE 已清 %lu 个 %llu 字节 → 现存 %lu 个 %llu 字节", before_files, before_bytes, after_files, after_bytes);
 }
 
-static void write_all(int fd, const char *p, size_t n) {
-    while (n) {
-        ssize_t w = write(fd, p, n);
-        if (w > 0) { p += w; n -= (size_t)w; }
-        else if (w < 0 && errno == EINTR) continue;
-        else break;
+typedef struct {
+    _Atomic uint64_t max_ns;
+    _Atomic uint64_t total_ns;
+    _Atomic uint64_t calls;
+    _Atomic uint64_t stalls;
+    _Atomic uint64_t bytes;
+    _Atomic uint64_t errors;
+    _Atomic uint32_t last_errno;
+} dm_io_role_stat_t;
+
+static dm_io_role_stat_t g_stat_prod;
+static dm_io_role_stat_t g_stat_file;
+static dm_io_role_stat_t g_stat_mirror;
+static dm_io_role_stat_t g_stat_fsync;
+static dm_io_role_stat_t g_stat_client;
+
+static void io_role_record(dm_io_role_stat_t *st, uint64_t dt_ns, ssize_t bytes, int err) {
+    atomic_fetch_add_explicit(&st->calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&st->total_ns, dt_ns, memory_order_relaxed);
+    if (bytes > 0) atomic_fetch_add_explicit(&st->bytes, (uint64_t)bytes, memory_order_relaxed);
+    if (err) {
+        atomic_fetch_add_explicit(&st->errors, 1, memory_order_relaxed);
+        atomic_store_explicit(&st->last_errno, (uint32_t)err, memory_order_relaxed);
     }
+    if (dt_ns > 5000000ull) atomic_fetch_add_explicit(&st->stalls, 1, memory_order_relaxed);
+    uint64_t cur = atomic_load_explicit(&st->max_ns, memory_order_relaxed);
+    while (dt_ns > cur && !atomic_compare_exchange_weak_explicit(&st->max_ns, &cur, dt_ns, memory_order_relaxed, memory_order_relaxed)) {}
 }
 
+static int stderr_pipe_cookie_writer(void *cookie, const char *buf, int size) {
+    (void)cookie;
+    if (size <= 0) return 0;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    int err = dm_log_ring_offer(buf, (size_t)size);
+    uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    io_role_record(&g_stat_prod, dt, err ? 0 : size, err);
+    // This is a lossy diagnostic stream: report consumption so stdio neither
+    // retries rejected bytes nor permanently marks stderr unusable on overflow.
+    return size;
+}
+
+
+void dm_log_io_roles_get(double *prod_max_ms, uint64_t *prod_stalls,
+                         double *file_max_ms, uint64_t *file_stalls,
+                         double *fsync_max_ms, uint64_t *fsync_count,
+                         uint64_t *mirror_stalls, uint64_t *client_stalls) {
+    if (prod_max_ms) *prod_max_ms = (double)atomic_load_explicit(&g_stat_prod.max_ns, memory_order_relaxed) / 1e6;
+    if (prod_stalls) *prod_stalls = atomic_load_explicit(&g_stat_prod.stalls, memory_order_relaxed);
+    if (file_max_ms) *file_max_ms = (double)atomic_load_explicit(&g_stat_file.max_ns, memory_order_relaxed) / 1e6;
+    if (file_stalls) *file_stalls = atomic_load_explicit(&g_stat_file.stalls, memory_order_relaxed);
+    if (fsync_max_ms) *fsync_max_ms = (double)atomic_load_explicit(&g_stat_fsync.max_ns, memory_order_relaxed) / 1e6;
+    if (fsync_count) *fsync_count = atomic_load_explicit(&g_stat_fsync.calls, memory_order_relaxed);
+    if (mirror_stalls) *mirror_stalls = atomic_load_explicit(&g_stat_mirror.stalls, memory_order_relaxed);
+    if (client_stalls) *client_stalls = atomic_load_explicit(&g_stat_client.stalls, memory_order_relaxed);
+}
+
+static int log_fsync_checked(int fd) {
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    int r = fsync(fd);
+    int err = (r == 0) ? 0 : errno;
+    uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    io_role_record(&g_stat_fsync, dt, 0, err);
+    return err;
+}
+
+static int log_write_role(int fd, const char *p, size_t n, dm_io_role_stat_t *role) {
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    size_t rem = n; ssize_t written = 0; int err = 0;
+    while (rem) {
+        ssize_t w = write(fd, p, rem);
+        if (w > 0) { p += w; rem -= (size_t)w; written += w; }
+        else if (w < 0 && errno == EINTR) continue;
+        else { err = w < 0 ? errno : EPIPE; break; }
+    }
+    uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    io_role_record(role, dt, written, err);
+    return err;
+}
 // 测试开关 DM_LOG_PORT=<端口>（冒烟用，Mac 经 iproxy 走 USB 连过来）：App 在本机回环监听，客户端连上先补发 boot.txt 已写内容，再逐行实时转发。
 // 不经 devicectl：实测 devicectl --console 首行延迟约 76 s，被杀的会话还拖住下一条命令约 80 s
 // Test switch DM_LOG_PORT=<port> (for the smoke test; the Mac connects over USB through iproxy): the App listens on local loopback; when a client connects it first replays what boot.txt already holds, then forwards line by line in real time.
@@ -122,11 +193,11 @@ static pthread_mutex_t g_log_client_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_log_client = -1;
 static char g_log_path[1024];
 static void log_client_write(const char *p, size_t n) {
-    pthread_mutex_lock(&g_log_client_mu);
-    if (g_log_client >= 0) {
-        while (n) { ssize_t w = write(g_log_client, p, n); if (w < 0 && errno == EINTR) continue; if (w <= 0) { close(g_log_client); g_log_client = -1; break; } p += w; n -= (size_t)w; }
+    // Caller owns g_log_client_mu across file write + live forwarding, so
+    // a connection replay cannot duplicate the just-persisted chunk.
+    if (g_log_client >= 0 && log_write_role(g_log_client, p, n, &g_stat_client)) {
+        close(g_log_client); g_log_client = -1;
     }
-    pthread_mutex_unlock(&g_log_client_mu);
 }
 static void *log_port_reader(void *arg) {   // 客户端发「quit」→ App 自行退出：下次拉起不用 devicectl --terminate-existing（实测它会拖住 37–120 s） | The client sends "quit" → the App exits by itself: the next launch does not need devicectl --terminate-existing (measured to stall for 37–120 s)
     // 收到即在同一连接上同步回执，客户端见到回执才关连接：iproxy 客户端一 EOF 就拆整条 usbmux 连接（iproxy.c 2.1.1），
@@ -139,7 +210,7 @@ static void *log_port_reader(void *arg) {   // 客户端发「quit」→ App 自
         if (strstr(cat, "dump")) { void crash_dump_now(const char *why); crash_dump_now("DM_LOG_PORT dump"); cat[0] = 0; }   // 冒烟判红时先发 dump 留现场（logport.py snapshot_hang），再发 quit | When the smoke test fails, send dump first to keep the diagnostics (logport.py snapshot_hang), then send quit
         if (strstr(cat, "quit")) {
             static const char ack[] = "DM_LOG_PORT：收到 quit，退出\n";
-            pthread_mutex_lock(&g_log_client_mu); write_all(c, ack, sizeof ack - 1); pthread_mutex_unlock(&g_log_client_mu);   // 同锁：不插进转发中的半行 | Same lock: do not insert into a half line being forwarded
+            pthread_mutex_lock(&g_log_client_mu); log_write_role(c, ack, sizeof ack - 1, &g_stat_client); pthread_mutex_unlock(&g_log_client_mu);
             fprintf(stderr, "%s", ack); dm_host_shutdown("DM_LOG_PORT quit"); _exit(0);
         }
         size_t m = strlen(cat), keep = m < sizeof acc - 1 ? m : sizeof acc - 1; memcpy(acc, cat + m - keep, keep); acc[keep] = 0;
@@ -179,46 +250,171 @@ static void *log_port_main(void *arg) {
     }
     return NULL;
 }
+static int log_drain_chunk(const char *p, size_t n, int batch_sync) {
+    int failed = 0;
+    pthread_mutex_lock(&g_log_client_mu);
+    if (batch_sync) {
+        failed = log_write_role(g_log, p, n, &g_stat_file);
+    } else {
+        size_t start = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (p[i] != '\n' && i + 1 != n) continue;
+            if (log_write_role(g_log, p + start, i + 1 - start, &g_stat_file)) failed = 1;
+            if (log_fsync_checked(g_log)) failed = 1;
+            start = i + 1;
+        }
+    }
+    log_client_write(p, n);
+    pthread_mutex_unlock(&g_log_client_mu);
+    if (g_log_stderr >= 0) log_write_role(g_log_stderr, p, n, &g_stat_mirror);
+    return failed;
+}
+
 static void *log_tee_main(void *unused) {
     (void)unused;
-    // 按一次管道read合并持久化，不延后到计时器；DM_IOS17_LOG_BATCH=0回退逐行。
-    // Coalesce durability per pipe read, with no timer delay; 0 restores per-line sync.
     const char *sync_mode = getenv("DM_IOS17_LOG_BATCH");
     int batch_sync = !sync_mode || strcmp(sync_mode, "0");
-    char buf[4096], line[8192];
-    size_t used = 0;
+    char buf[DM_LOG_RING_CHUNK];
+    int durable_failed = 0;
+    uint64_t unsynced = 0, last_sync = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     for (;;) {
-        ssize_t n = read(g_log_pipe[0], buf, sizeof buf);
-        if (n == 0) break;
-        if (n < 0) { if (errno == EINTR) continue; break; }
-        int wrote_log = 0;
-        for (ssize_t i = 0; i < n; i++) {
-            if (used < sizeof line) line[used++] = buf[i];
-            if (buf[i] == '\n') {
-                pthread_mutex_lock(&g_log_client_mu); write_all(g_log, line, used); wrote_log = 1; if (!batch_sync) fsync(g_log); pthread_mutex_unlock(&g_log_client_mu);   // 与补发同锁：补发读文件时不会漏这行也不会重发 | Same lock as the replay: while the replay reads the file it neither misses this line nor sends it twice
-                if (g_log_stderr >= 0) write_all(g_log_stderr, line, used);
-                log_client_write(line, used);
-                used = 0;
-            } else if (used == sizeof line) {
-                write_all(g_log, line, used); wrote_log = 1;
-                used = 0;
-            }
+        size_t n = dm_log_ring_take(buf, sizeof buf);
+        if (n) {
+            if (log_drain_chunk(buf, n, batch_sync)) durable_failed = 1;
+            atomic_fetch_add_explicit(&g_log_ring.completed_bytes, n, memory_order_relaxed);
+            unsynced += n;
         }
-        if (batch_sync && wrote_log) { pthread_mutex_lock(&g_log_client_mu); fsync(g_log); pthread_mutex_unlock(&g_log_client_mu); }
-    }
-    if (used) {
-        write_all(g_log, line, used);
-        fsync(g_log);
-        write_all(g_log_stderr, line, used);
+        // Raw fd 2 remains nonblocking and is checked at most 50 ms after arrival.
+        ssize_t raw = read(g_log_pipe[0], buf, sizeof buf);
+        if (raw > 0) {
+            atomic_fetch_add_explicit(&g_log_ring.raw_pipe_bytes, (uint64_t)raw, memory_order_relaxed);
+            if (log_drain_chunk(buf, (size_t)raw, batch_sync)) durable_failed = 1;
+            unsynced += (uint64_t)raw;
+        }
+        uint64_t completed = atomic_load_explicit(&g_log_ring.completed_bytes, memory_order_relaxed);
+        uint64_t durable = atomic_load_explicit(&g_log_ring.durable_bytes, memory_order_relaxed);
+        uint64_t requested = atomic_load_explicit(&g_log_ring.flush_target, memory_order_acquire);
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        // Writes stay prompt. Only durability is coalesced: 64 KiB, 1 second,
+        // or an explicit accepted-byte snapshot from export/shutdown.
+        if (unsynced && (!batch_sync || unsynced >= 65536 || now - last_sync >= 1000000000ull || requested > durable)) {
+            if (batch_sync && log_fsync_checked(g_log)) durable_failed = 1;
+            if (!durable_failed) atomic_store_explicit(&g_log_ring.durable_bytes, completed, memory_order_release);
+            unsynced = 0; last_sync = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        }
+        if (!n && raw <= 0) {
+            struct timespec deadline; clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_nsec += 50000000;
+            if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+            pthread_mutex_lock(&g_log_ring.mutex);
+            // Check under the admission mutex so an empty->nonempty signal cannot be lost.
+            int flush_pending = !durable_failed && completed > atomic_load_explicit(&g_log_ring.durable_bytes, memory_order_acquire) &&
+                atomic_load_explicit(&g_log_ring.flush_target, memory_order_acquire) > atomic_load_explicit(&g_log_ring.durable_bytes, memory_order_relaxed);
+            if (!g_log_ring.used && !flush_pending) pthread_cond_timedwait(&g_log_ring.wake, &g_log_ring.mutex, &deadline);
+            pthread_mutex_unlock(&g_log_ring.mutex);
+        }
     }
     return NULL;
+}
+
+void dm_log_buffer_stats_get(dm_log_buffer_stats_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->capacity_bytes = DM_LOG_RING_CAPACITY;
+#define LOG_RING_STAT(field, member) out->field = atomic_load_explicit(&g_log_ring.member, memory_order_relaxed)
+    LOG_RING_STAT(queued_bytes, queued); LOG_RING_STAT(high_water_bytes, high_water);
+    LOG_RING_STAT(offered_chunks, offered_chunks); LOG_RING_STAT(offered_bytes, offered_bytes);
+    LOG_RING_STAT(accepted_chunks, accepted_chunks); LOG_RING_STAT(accepted_bytes, accepted_bytes);
+    LOG_RING_STAT(dropped_chunks, dropped_chunks); LOG_RING_STAT(dropped_bytes, dropped_bytes);
+    LOG_RING_STAT(contention_drops, contention_drops); LOG_RING_STAT(overflow_drops, overflow_drops);
+    LOG_RING_STAT(oversize_drops, oversize_drops); LOG_RING_STAT(unavailable_drops, unavailable_drops);
+    LOG_RING_STAT(dequeued_bytes, dequeued_bytes); LOG_RING_STAT(completed_bytes, completed_bytes);
+    LOG_RING_STAT(durable_bytes, durable_bytes); LOG_RING_STAT(raw_pipe_bytes, raw_pipe_bytes);
+    LOG_RING_STAT(startup_errno, startup_errno); LOG_RING_STAT(worker_ready, ready);
+#undef LOG_RING_STAT
+    out->producer_max_ns = atomic_load_explicit(&g_stat_prod.max_ns, memory_order_relaxed);
+    out->producer_calls = atomic_load_explicit(&g_stat_prod.calls, memory_order_relaxed);
+    out->producer_stalls = atomic_load_explicit(&g_stat_prod.stalls, memory_order_relaxed);
+    out->file_bytes = atomic_load_explicit(&g_stat_file.bytes, memory_order_relaxed);
+    out->file_errors = atomic_load_explicit(&g_stat_file.errors, memory_order_relaxed);
+    out->mirror_errors = atomic_load_explicit(&g_stat_mirror.errors, memory_order_relaxed);
+    out->client_errors = atomic_load_explicit(&g_stat_client.errors, memory_order_relaxed);
+    out->fsync_errors = atomic_load_explicit(&g_stat_fsync.errors, memory_order_relaxed);
+}
+
+int dm_log_flush(unsigned timeout_ms) {
+    uint64_t target = atomic_load_explicit(&g_log_ring.accepted_bytes, memory_order_acquire);
+    uint64_t requested = atomic_load_explicit(&g_log_ring.flush_target, memory_order_relaxed);
+    while (target > requested && !atomic_compare_exchange_weak_explicit(&g_log_ring.flush_target, &requested, target, memory_order_release, memory_order_relaxed)) {}
+    pthread_mutex_lock(&g_log_ring.mutex);
+    pthread_cond_signal(&g_log_ring.wake);
+    pthread_mutex_unlock(&g_log_ring.mutex);
+    if (timeout_ms > 2000) timeout_ms = 2000;
+    uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) + (uint64_t)timeout_ms * 1000000ull;
+    for (;;) {
+        if (!atomic_load_explicit(&g_log_ring.ready, memory_order_acquire) ||
+            atomic_load_explicit(&g_stat_file.errors, memory_order_relaxed) ||
+            atomic_load_explicit(&g_stat_fsync.errors, memory_order_relaxed)) return -1;
+        if (atomic_load_explicit(&g_log_ring.durable_bytes, memory_order_acquire) >= target) return 1;
+        if (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) >= deadline) return 0;
+        struct timespec delay = {.tv_nsec = 1000000}; nanosleep(&delay, NULL);
+    }
+}
+
+static int log_open(void) {
+    int err = g_log < 0 ? (errno ? errno : EBADF) : 0;
+    int saved_stderr = dup(2);
+    FILE *hooked = NULL;
+    if (g_log < 0) goto failed;
+    if (saved_stderr < 0) { err = errno; goto failed; }
+    hooked = funopen(NULL, NULL, stderr_pipe_cookie_writer, NULL, NULL);
+    if (!hooked) { err = errno ? errno : ENOMEM; goto failed; }
+    if (setvbuf(hooked, NULL, _IONBF, 0)) { err = errno ? errno : ENOMEM; goto failed; }
+    memset(g_log_ring.data, 0, sizeof g_log_ring.data);
+    if (pipe(g_log_pipe)) { err = errno; goto failed; }
+    for (int i = 0; i < 2; i++) {
+        int flags = fcntl(g_log_pipe[i], F_GETFL);
+        if (flags < 0 || fcntl(g_log_pipe[i], F_SETFL, flags | O_NONBLOCK) < 0) { err = errno; goto failed; }
+    }
+    if (dup2(g_log_pipe[1], 2) < 0) { err = errno; goto failed; }
+    if (getenv("DM_LOG_TEE")) g_log_stderr = saved_stderr;
+    err = pthread_create(&g_log_thread, NULL, log_tee_main, NULL);
+    if (err) goto failed;
+    pthread_detach(g_log_thread);
+    close(g_log_pipe[1]); g_log_pipe[1] = -1;
+    if (g_log_stderr < 0) close(saved_stderr);
+    stderr = hooked;
+    g_log_started = 1;
+    atomic_store_explicit(&g_log_ring.ready, 1, memory_order_release);
+    const char *port = getenv("DM_LOG_PORT");
+    if (port) {
+        pthread_t lp; int rc = pthread_create(&lp, NULL, log_port_main, (void *)(intptr_t)atoi(port));
+        if (!rc) pthread_detach(lp);
+        else plog("DM_LOG_PORT startup failed: %s", strerror(rc));
+    }
+    plog("LOG_BUFFER capacity=%u max_offer=%u durable=worker-fsync raw_fd2=nonblocking drops=exported", DM_LOG_RING_CAPACITY, DM_LOG_RING_MAX_OFFER);
+    return 0;
+failed:
+    atomic_store_explicit(&g_log_ring.startup_errno, (uint32_t)err, memory_order_release);
+    if (saved_stderr >= 0) dup2(saved_stderr, 2);
+    char message[256]; int n = snprintf(message, sizeof message, "LOG_BUFFER startup failed errno=%d (%s); game not started\n", err, strerror(err));
+    if (n > 0) {
+        write(2, message, (size_t)n);
+        if (g_log >= 0) { log_write_role(g_log, message, (size_t)n, &g_stat_file); log_fsync_checked(g_log); }
+    }
+    if (saved_stderr >= 0) close(saved_stderr);
+    g_log_stderr = -1;
+    for (int i = 0; i < 2; i++) if (g_log_pipe[i] >= 0) { close(g_log_pipe[i]); g_log_pipe[i] = -1; }
+    if (hooked) fclose(hooked);
+    return -1;
 }
 
 void plog(const char *fmt, ...) {
     char b[1024]; va_list ap; va_start(ap, fmt); int n = vsnprintf(b, sizeof b - 1, fmt, ap); va_end(ap);
     if (n < 0) return; if (n > (int)sizeof b - 2) n = sizeof b - 2; b[n++] = '\n';
-    if (g_log_tee) write_all(2, b, (size_t)n);
-    else if (g_log >= 0) { write(g_log, b, n); fsync(g_log); } else write(2, b, n);
+    if (g_log_started) stderr_pipe_cookie_writer(NULL, b, n);
+    else if (g_log >= 0) { log_write_role(g_log, b, (size_t)n, &g_stat_file); log_fsync_checked(g_log); }
+    else write(2, b, (size_t)n);
 }
 
 // ---- 启动计时 T1–T6：零点 = 进程创建（内核 p_starttime，墙钟），单位 ms；日志开了以后写进 <模式>.txt ----
@@ -1229,19 +1425,21 @@ int main(int argc, char *argv[]) {
     // the previous session's boot.txt kept as boot.previous.txt and this launch's log renamed to boot.txt (log_promote).
     if ([g_mode isEqualToString:@"boot"]) log_file = strdup([doc stringByAppendingPathComponent:@"boot.launch.txt"].fileSystemRepresentation);
     g_log = open(log_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (g_log < 0) { log_open(); return 1; }
 #if defined(DM_LEGACY_IOS17)
     if ([g_mode isEqualToString:@"boot"]) {
         NSString *value = [[NSString stringWithContentsOfFile:[doc stringByAppendingPathComponent:@"render_profile.txt"] encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         int profile = dm_power_profile(getenv("DM_POWER_PROFILE") ?: value.UTF8String);
-        const char *name = profile==1?"native":profile==2?"conservative":profile==3?"native30":"balanced";
+        const char *name = profile==1?"native":profile==2?"conservative":profile==3?"native30":profile==4?"perf60":"balanced";
         setenv("DM_POWER_PROFILE",name,0);
         if((!profile || profile==3) && !getenv("DM_FPS"))setenv("DM_FPS","30",0);
+        if(profile==4 && !getenv("DM_FPS"))setenv("DM_FPS","60",0);
         if(profile==2 && !getenv("DM_LEGACY_RESOURCE_ALL"))setenv("DM_LEGACY_RESOURCE_ALL","1",0);
-        plog("boot: iOS17 性能档 %s（balanced=720p/30FPS；native=原生；native30=原生/30FPS；conservative=原生/全资源声明）",name);
+        plog("boot: iOS17 性能档 %s（balanced=720p/30FPS；native=原生/60FPS；perf60=900p/60FPS；native30=原生/30FPS；conservative=原生/全资源声明）",name);
         NSString *logSync = [[NSString stringWithContentsOfFile:[doc stringByAppendingPathComponent:@"log_sync_profile.txt"] encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         BOOL lineSync = [logSync isEqualToString:@"baseline"];
         setenv("DM_IOS17_LOG_BATCH",lineSync?"0":"1",0);
-        plog("boot: iOS17 日志同步档 %s（按管道read同步；不丢日志、不降低画质）",getenv("DM_IOS17_LOG_BATCH")[0]=='0'?"baseline-line":"optimized-read-batch");
+        plog("boot: iOS17 日志同步档 %s（后台有界队列；溢出计数导出）",getenv("DM_IOS17_LOG_BATCH")[0]=='0'?"baseline-line":"optimized-ring-batch");
         plog("boot: iOS17 测量档 %s（normal不额外采样；timing逐帧+线程CPU；gpu含逐通道计时，不能当性能成绩）",measurementProfile.UTF8String);
         NSString *upload = [[NSString stringWithContentsOfFile:[doc stringByAppendingPathComponent:@"upload_profile.txt"] encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         BOOL oldUpload=[upload isEqualToString:@"baseline"];
@@ -1251,6 +1449,8 @@ int main(int argc, char *argv[]) {
 
     }
 #endif
+    strlcpy(g_log_path, log_file, sizeof g_log_path);
+    if (log_open()) return 1;
     if ([g_mode isEqualToString:@"boot"]) {
         // 日志头：报问题时最先要知道的四样（哪个构建、什么机器、什么系统、什么时候）
         // Log header: the four things you need first when a problem is reported (which build, what machine, what OS, when)
@@ -1262,18 +1462,6 @@ int main(int argc, char *argv[]) {
         // 跨提交附件有效性账本的违规记录落 Documents：触发过的键以后每次启动都不再做（玩家最多见一次），也是回收现场的途径
         // Violation records of the cross-commit attachment validity ledger go to Documents: a key that has triggered is never done again on any later launch (the player sees it at most once); it is also how the diagnostic record gets collected
         setenv("DM_XV_FILE", [doc stringByAppendingPathComponent:@"xv_violation.txt"].fileSystemRepresentation, 0);
-        const char *log_port = getenv("DM_LOG_PORT");
-        strlcpy(g_log_path, log_file, sizeof g_log_path);
-        if ((getenv("DM_LOG_TEE") || log_port) && !pipe(g_log_pipe) && (!getenv("DM_LOG_TEE") || (g_log_stderr = dup(2)) >= 0) &&
-            !pthread_create(&g_log_thread, NULL, log_tee_main, NULL)) {
-            g_log_tee = 1;
-            dup2(g_log_pipe[1], 2);
-            close(g_log_pipe[1]);
-            g_log_pipe[1] = -1;
-            pthread_t lp; if (log_port && !pthread_create(&lp, NULL, log_port_main, (void *)(intptr_t)atoi(log_port))) pthread_detach(lp);
-        } else {
-            dup2(g_log, 2);                           // 宿主 LOG/die 写 stderr → 同一日志文件（提前装载线程也写） | Host LOG/die write to stderr → the same log file (the early-load thread writes there too)
-        }
         metal_cache_report_and_clean();
         char why[2048];
         { id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); g_no_bc = !dev.supportsBCTextureCompression || getenv("DM_TEST_NO_BC");

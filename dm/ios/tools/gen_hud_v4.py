@@ -19,13 +19,15 @@ from PIL import Image
 HERE=os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0,HERE)
 import romfs_art, hud_v4_design, layout_patch
 from gen_paths import gen_dir
-ROMFS=sys.argv[1]; OUT=sys.argv[2] if len(sys.argv)>2 else gen_dir('NativeHUD','v4')   # 试调时可指定输出目录 | The output directory can be specified when tuning
+args_in=sys.argv[1:]; overlay_only='--overlay-only' in args_in
+if overlay_only: args_in.remove('--overlay-only')
+ROMFS=args_in[0]; OUT=args_in[1] if len(args_in)>1 else gen_dir('NativeHUD','v4')   # 试调时可指定输出目录 | The output directory can be specified when tuning
 os.makedirs(OUT,exist_ok=True); SRC=hud_v4_design.Source(ROMFS)
 def load(var='C'): return hud_v4_design.load(SRC, var)
 # 试调量（腰带三项按手机实拍校正：原版小药水贴图在格内偏右下，以手机常见的小药水居中为准；其余 Mac 截图逐像素量出）：腰带位移 / 格距、经验条位移、数值文字位移与字号
 # Tuning values (the three belt items are corrected from real phone captures: the original game's small potion texture sits toward the lower right within the slot, so the small potion commonly seen on the phone is taken as centered; the rest are measured pixel by pixel from Mac screenshots): belt offset / slot pitch, experience bar offset, value text offset and font size
 T=dict(bx=6.5,by=5,bpx=25,bs=1.6,ex=-7,ey=-15,txt=43,tx=-238,ts=1.4)   # bs：腰带缩放（药水对效果图 78 像素图标） | bs: belt scale (potions matched to the mockup's 78-pixel icons)
-if len(sys.argv)>3: T.update(json.loads(sys.argv[3]))   # 试调：覆盖上面的量 | Tuning: overrides the values above
+if len(args_in)>2: T.update(json.loads(args_in[2]))   # 试调：覆盖上面的量 | Tuning: overrides the values above
 g=load('C'); W,H=g['W'],g['H']; U=H/2160; RX0,RY0=-1473,-417
 ux=lambda px:(px-W/2)/U-RX0; uy=lambda py:(py-H)/U-RY0
 BASE='PANEL/HUD_02/BugBTN'   # 借用路径，见登记表 | Borrowed path, see the registry
@@ -161,15 +163,16 @@ for n in range(1,9):      # 难度数字：效果图方案 C（Exocet + 原版�
 # 前端放进深色圆底 + 古铜圆环（同 PC 版圆形技能键的样式），不再把方形图标塞进圆圈
 # Skill silhouette atlas: from the official skill atlas (Sources/TouchArt/dm_native_skill_N.png, frame positions unchanged) take only the silver silhouette (bright, low saturation; drop the rusty iron square plate and the four corner rivets),
 # the front end puts it on a dark round base + bronze ring (same style as the PC version's round skill buttons), no longer stuffing a square icon into a circle
-ART=os.path.join(HERE,'..','Sources','TouchArt'); man=json.load(open(os.path.join(ART,'native_art_manifest.json')))
-for a_ in man['assets']:
-    if not a_['asset'].startswith('dm_native_skill_'): continue
-    im=np.asarray(Image.open(os.path.join(ART,a_['asset'])).convert('RGBA')).astype(float)/255
-    mx=im[...,:3].max(-1); mn=im[...,:3].min(-1); sat=(mx-mn)/np.maximum(mx,1e-6)
-    al=np.clip((mx-0.42)/0.18,0,1)*np.clip((0.32-sat)/0.12,0,1)*im[...,3]
-    fw,pitch=a_['frame_width'],a_['frame_pitch']; Hh,Ww=al.shape; yy,xx=np.mgrid[0:Hh,0:Ww]
-    al*=np.hypot((xx%pitch)-fw/2,yy-Hh/2)<fw*0.46
-    Image.fromarray((np.dstack([im[...,:3],al])*255).astype('uint8')).save(os.path.join(UI,'sil_'+a_['asset']))
+if not overlay_only:
+    ART=os.path.join(HERE,'..','Sources','TouchArt'); man=json.load(open(os.path.join(ART,'native_art_manifest.json')))
+    for a_ in man['assets']:
+        if not a_['asset'].startswith('dm_native_skill_'): continue
+        im=np.asarray(Image.open(os.path.join(ART,a_['asset'])).convert('RGBA')).astype(float)/255
+        mx=im[...,:3].max(-1); mn=im[...,:3].min(-1); sat=(mx-mn)/np.maximum(mx,1e-6)
+        al=np.clip((mx-0.42)/0.18,0,1)*np.clip((0.32-sat)/0.12,0,1)*im[...,3]
+        fw,pitch=a_['frame_width'],a_['frame_pitch']; Hh,Ww=al.shape; yy,xx=np.mgrid[0:Hh,0:Ww]
+        al*=np.hypot((xx%pitch)-fw/2,yy-Hh/2)<fw*0.46
+        Image.fromarray((np.dstack([im[...,:3],al])*255).astype('uint8')).save(os.path.join(UI,'sil_'+a_['asset']))
 # 技能键标签（PC 定稿演示图同款：主键「攻击」、其余 F1–F4 / 第二套 F5–F8），原版界面字体加粗米色 + 右下暗影，按效果图像素预渲染
 # Skill button labels (same as the final PC demo image: main button 「攻击」(Attack), the rest F1–F4 / second set F5–F8), the original game's UI font in bold beige + lower-right dark shadow, pre-rendered at mockup pixels
 lf=g['num'](34)

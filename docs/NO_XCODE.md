@@ -1,5 +1,3 @@
-> **iOS17 fork preview:** use this fork's SAME release-tag source and its `D2RMobile-shell-ios17-…-build-input.zip`. Build input only, NOT installable: no guest program, game resources/shaders or complete ASTC. Upstream benchmarks below from other models are not A16 acceptance. Free-signing memory entitlements are not equivalent to TrollStore. The new shell path has no certified long-session iOS17 device run.
-
 # Building an installable package without Xcode (experimental)
 
 The normal route is to build the whole app with Xcode on a Mac (see "Building" on the front page). This page describes another route: we build, ahead of time, a **"shell" package that contains no game content at all**; you put the content into it on your own computer from your own game files, and then install it on your phone with a common sideloading tool. You never build or sign with Xcode, and you do not need a paid Apple developer account.
@@ -17,7 +15,7 @@ The normal route is to build the whole app with Xcode on a Mac (see "Building" o
 
 ## What the shell contains and does not contain
 
-Download this fork's iOS17 build-input ZIP from [Releases](https://github.com/4ppp44/d2r-mobile-ios17/releases), and use the source from that SAME release tag. The ZIP contains the host, public icon and public tables, not a guest program, game-generated UI/overlays/shaders or generated game data tables. The upstream game-content scan remains enabled; this is a technical content audit, not a legal rights clearance guarantee.
+Download the shell from this repository's [Releases page](https://github.com/jhaizhou-ops/d2r-mobile/releases). There are two on the Releases page: `D2RMobile-shell-build-input.zip` for iOS 26 and later, `D2RMobile-shell-ios18-build-input.zip` for iOS 18 – 25 ([OLDER_SYSTEMS.md](OLDER_SYSTEMS.md)); pick the one for your phone's system, the steps after that are the same. The shell (about 4 MB) contains only our own host program, the icon and two tables that are public in this repository. It does **not** contain: the game program, shaders, the overlay, UI art, or any data table generated from game files. The script that builds the shell (`dm/ios/tools/shell_build.sh`) finishes by searching every file in the shell for real game content, and refuses to produce a shell if it finds any.
 
 **The shell is build input, not an app to install** (which is why it is a `.zip`, not an `.ipa`). If you rename it and install it as is, the app shows a "This Package Is Not Ready" dialog on launch, lists what is missing and points you back to step 1 below; it does not start the game.
 

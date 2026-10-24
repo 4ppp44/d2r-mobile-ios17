@@ -98,7 +98,7 @@ Switch 原版着色器包
 | `shader_map.py`、`maxwell_refs.py` | 生成着色器映射表；从机器码读资源引用 |
 | `nvn_slots.py`、`gen_protos.py` | 生成 `nvn_slots.tsv` / `names.txt`、`nvn_protos.h` / 跳板 |
 | `tbdr_budget.py`、`tbdr_load_dead.py`、`tbdr_store_dead.py`、`tbdr_pass_merge.py` | 读 `DM_NVN_PASSDUMP` 的日志，分析每帧各渲染通道附件的读入 / 写回量 |
-| `passgpu_top.py` | 读 `DM_NVN_PASSGPU` 的输出，按通道列 GPU 时间 |
+| `passgpu_top.py` | 读 `DM_NVN_PASSGPU` 的输出，按通道列 GPU 时间。参数给测量目录（只在该目录里找 `passes.tsv`，没有再找旧名 `passgpu.tsv`）或直接给表文件：`passgpu_top.py <目录|文件> [帧下限] [前列数]`。设备测量档从第 0 帧记起，要看全部用 `-1` 作帧下限 |
 | `nometal_run.py` | 在没有苹果 Metal 编译器的机器上跑这条翻译链：着色器以源码进库，到手机上再编 |
 
 ## 构建

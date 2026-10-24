@@ -3,23 +3,3 @@
 .iosdd_mac/
 .iosdd_*/
 .DS_Store
-
-# iOS17 fork: private inputs and local deliveries never belong in Git
-/artifacts/
-/inputs/
-/work/
-/releases/
-*.ipa
-*.xci
-*.nsp
-*.keys
-*.p8
-*.p12
-*.mobileprovision
-*.d2s
-*.d2i
-*.MP4
-*.mp4
-*Diagnostics*.txt
-/Legacy Device Pack/
-/D2R Mobile Resources/

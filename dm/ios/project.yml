@@ -99,7 +99,7 @@ targets:
       PRODUCT_BUNDLE_IDENTIFIER: ${DM_BUNDLE_ID}
       ENABLE_USER_SCRIPT_SANDBOXING: NO              # 构建前脚本「从游戏文件生成资源」要读工程外的 RomFS（沙盒里读不到） | The pre-build script 「从游戏文件生成资源」(Generate assets from game files) needs to read the RomFS outside the project (unreadable inside the sandbox)
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-      MARKETING_VERSION: "1.0.17"
+      MARKETING_VERSION: "1.0.18"
       CURRENT_PROJECT_VERSION: $(DM_BUILD_NUMBER)   # TestFlight 每次上传须递增；tools/testflight.sh 传入，本地构建缺省 1 | Must be incremented for every TestFlight upload; passed in by tools/testflight.sh, defaults to 1 for local builds
       DM_BUILD_NUMBER: "1"
       DM_UPDATE_URL: ""                             # tools/adhoc.sh 在环境里有 DM_UPDATE_URL 时传入；本地构建缺省空 | Passed in by tools/adhoc.sh when DM_UPDATE_URL is in the environment; empty by default for local builds
@@ -137,7 +137,7 @@ targets:
       DM_DEVICE_FAMILY: "1,2"
       IPHONEOS_DEPLOYMENT_TARGET: "26.4"
       SWIFT_VERSION: "6.0"
-      MARKETING_VERSION: "1.0.17"
+      MARKETING_VERSION: "1.0.18"
       CURRENT_PROJECT_VERSION: $(DM_BUILD_NUMBER)
       DM_BUILD_NUMBER: "1"
   TouchSmokeTests:

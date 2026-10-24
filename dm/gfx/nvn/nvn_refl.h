@@ -30,6 +30,8 @@ typedef struct {
     uint16_t tg[3];          // 计算线程组大小（无 = 0） | Compute thread group size (none = 0)
     uint8_t route_b, has_c1; // B 路线；有 c1 常数段 | Route B; has a c1 constant segment
     uint8_t drv_read[3];     // B：运行时读驱动段 c0 / c2（下标 0、2；出包时由 MSL 静态统计，tools/dmsh_build.py drv_reads） | B: reads driver segments c0 / c2 at runtime (indices 0, 2; gathered statically from the MSL at packaging time, tools/dmsh_build.py drv_reads)
+    uint8_t drv_noff[3];     // B：着色器实际读取的 16 字节槽偏移数（0 = 整段不读；全库 ≤10、全为常量下标） | B: count of 16-byte slot offsets the shader actually reads (0 = segment unread; whole library ≤10, all constant indices)
+    uint16_t drv_off[3][10]; // B：被读槽的段内字节偏移（升序，出包静态统计） | B: in-segment byte offsets of the read slots (ascending, from packaging-time static analysis)
     uint16_t c1_len;         // c1 常数段长度（B；全库 0 / 256 / 512 / 768） | Length of the c1 constant segment (B; 0 / 256 / 512 / 768 across the whole library)
     // 全覆盖首绘证明用（dmsh_build.py raster_facts；缺字段 = 不可证）：顶点——位置 xyz 原样取自属性 pos_attr（-1 = 否），w 为常数 1（pos_w1）或取同属性 .w；
     // 片元——可能丢弃、写 sample_mask、写出的颜色号位图

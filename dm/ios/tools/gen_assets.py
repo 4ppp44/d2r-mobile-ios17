@@ -26,21 +26,34 @@ STEPS = [('加宽储藏箱', ['gen_widestash_art.py', '{R}']), ('编年史盖板
          ('技能图集与索引', ['native_art/generate.py', '{R}']), ('底部 UI v4', ['gen_hud_v4.py', '{R}'])]
 
 
-def stamp(R):
+def stamp(R, overlay_only=False):
     h = hashlib.sha256(open(os.path.join(R, 'data', 'build_manifest.psv'), 'rb').read())
-    for d, ds, fs in sorted(os.walk(HERE)):
+    h.update(b'\0overlay-only\0' if overlay_only else b'\0full-assets\0')
+    # 就地剪枝，生成的 Python 缓存不参与资源指纹。 | Prune in place; generated Python caches are not asset inputs.
+    for d, ds, fs in os.walk(HERE):
         ds[:] = sorted(x for x in ds if x != '__pycache__')
-        for f in sorted(fs): h.update(os.path.relpath(os.path.join(d, f), HERE).encode()); h.update(open(os.path.join(d, f), 'rb').read())
+        for f in sorted(x for x in fs if not x.endswith('.pyc')): h.update(os.path.relpath(os.path.join(d, f), HERE).encode()); h.update(open(os.path.join(d, f), 'rb').read())
     pc = os.environ.get('DM_PC_DATA') or os.path.join(DM_ROOT, 'data/assets-src/raw')
     h.update(('%s|%s|%s' % (pc, os.path.isdir(pc), os.environ.get('DM_REQUIRE_PC_ART', ''))).encode())
     return h.hexdigest()
 
 
-def ensure(R):
-    """产物齐、指纹没变就直接返回；否则拿锁生成。返回 True = 这次重出了。 | If the build output is complete and the fingerprint unchanged, return directly; otherwise take the lock and generate. Returns True = regenerated this time."""
+def ensure(R, overlay_only=False):
+    """产物齐、指纹没变就直接返回；否则拿锁生成。返回 True = 这次重出了。 | Reuse fresh complete output; otherwise generate under the shared lock."""
     root = gen_paths.gen_dir(); st = os.path.join(root, '.stamp'); lock = os.path.join(root, '.gen_lock')
-    outs = [os.path.join(root, 'NativeHUD', 'v4', 'base.png'), os.path.join(HERE, '..', 'Sources', 'TouchArt', 'dm_native_skill_0.png'), os.path.join(HERE, '..', 'Sources', 'dm_touch_native_art.c')]
-    want = stamp(R); fresh = lambda: all(map(os.path.isfile, outs)) and os.path.isfile(st) and open(st).read() == want
+    v4 = os.path.join(root, 'NativeHUD', 'v4')
+    outs = [os.path.join(v4, 'base.png'), os.path.join(v4, 'hud.json'), os.path.join(v4, 'hud_v4_ui', 'ui.json')]
+    full_outs = outs + [os.path.join(HERE, '..', 'Sources', 'TouchArt', 'dm_native_skill_0.png'),
+                        os.path.join(HERE, '..', 'Sources', 'dm_touch_native_art.c'),
+                        os.path.join(v4, 'hud_v4_ui', 'sil_dm_native_skill_0.png')]
+    if not overlay_only: outs = full_outs
+    # 精简请求可沿用完整产物，避免覆盖层生成重出底栏并清掉技能剪影。 | An overlay request accepts fresh full output, preserving the skill silhouettes.
+    want = stamp(R, overlay_only=overlay_only); full_want = stamp(R) if overlay_only else want
+    def fresh():
+        if not os.path.isfile(st): return False
+        have = open(st).read()
+        if have == full_want: return all(map(os.path.isfile, full_outs))
+        return have == want and all(map(os.path.isfile, outs))
     if fresh(): return False
     t0 = time.time()
     while True:
@@ -57,14 +70,16 @@ def ensure(R):
         open(os.path.join(lock, 'pid'), 'w').write(str(os.getpid()))
         if fresh(): return False   # 等锁期间别人已经生成好了 | Someone else already generated it while we waited for the lock
         if os.path.exists(st): os.remove(st)
-        run_steps(R); open(st, 'w').write(want); return True
+        run_steps(R, overlay_only=overlay_only); open(st, 'w').write(want); return True
     finally: shutil.rmtree(lock, ignore_errors=True)
 
 
-def run_steps(R):
+def run_steps(R, overlay_only=False):
     for name, cmd in STEPS:
-        t0 = time.time(); r = subprocess.run([sys.executable] + [os.path.join(HERE, c) if i == 0 else c.replace('{R}', R) for i, c in enumerate(cmd)],
-                                            capture_output=True, text=True)
+        if overlay_only and cmd[0] == 'native_art/generate.py': continue
+        argv = [sys.executable] + [os.path.join(HERE, c) if i == 0 else c.replace('{R}', R) for i, c in enumerate(cmd)]
+        if overlay_only and cmd[0] == 'gen_hud_v4.py': argv.append('--overlay-only')
+        t0 = time.time(); r = subprocess.run(argv, capture_output=True, text=True)
         if r.returncode: sys.exit('🔴 生成「%s」失败：\n%s%s' % (name, r.stdout[-1500:], r.stderr[-1500:]))
         tip = [l for l in r.stdout.splitlines() if l.startswith(('没找到', '底栏素材'))]
         print('%s：%.1f 秒%s' % (name, time.time() - t0, ('（' + tip[0] + '）') if tip else ''))

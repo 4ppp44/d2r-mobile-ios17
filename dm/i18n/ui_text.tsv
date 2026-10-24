@@ -81,6 +81,11 @@ dmCustomQ3dQuality	画质优先	Quality first	自定义页「3D 画质」单选�
 dmCustomQ3dQualityHint	始终保持设定的 3D 清晰度	Always keeps the set 3D resolution	画质优先下面的说明小字
 dmCustomLootFilter	掉落过滤（噩梦起自动隐藏杂物）	Loot Filter (auto, Nightmare+)	自定义页开关；Loot Filter 是原版过滤器的英文名
 dmCustomAutoBuff	自动补上增益技能（站着不动时）	Auto-recast buffs when idle	自定义页开关
+dmCustomTouchSwapAbove	换组键位置	Skill-set switch position	自定义页换组位置单选
+dmCustomTouchSwapNear	换组键：传送门左侧	Skill-set switch: left of portal	默认位置，touch_swap_above=0
+dmCustomTouchSwapNearHint	沿传送门外侧弧线排布，松手后切换	On the portal arc; release to switch	换组近位说明
+dmCustomTouchSwapFar	换组键：技能区上方	Skill-set switch: above skills	分离位置，touch_swap_above=1
+dmCustomTouchSwapFarHint	位于技能区左上，松手后切换	Above-left of skills; release to switch	换组上位说明
 dmCustomLang	语言 / Language	语言 / Language	自定义页语言那一行的标签。两种界面写同样的中英两个词：这一行的文字控件指定原版的全球字体 BlizzardGlobal（英文界面缺省的 Formal 字体没有汉字，全球字体有；原版标题页、队伍名、合规提示同样按控件指定它）
 dmCustomLangZh	中文	中文	语言行的选项一（两种界面都写「中文」，同上用全球字体）
 dmCustomLangEnOpt	English	English	语言行的选项二

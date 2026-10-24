@@ -20,7 +20,7 @@
 set -u
 KIND=${1:-ios}; case $KIND in ios|mac) ;; *) echo "用法：shell_build.sh [ios|mac]"; exit 2;; esac
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); SRC=$(cd "$HERE/../.." && pwd)        # SRC = dm/
-ROOT=${DM_ROOT:-$HOME/dm-work}; O=${DM_SHELL_OUT:-$ROOT/build/shell/$KIND}; W=$O/tree; DD=$O/dd
+ROOT=${DM_ROOT:-$HOME/dm-work}; O=$ROOT/build/shell/$KIND; W=$O/tree; DD=$O/dd
 t() { echo "[$(date +%T)] $*"; }; die() { t "🔴 $*"; exit 1; }
 mkdir -p "$O" && rm -rf "$W" "$O/ref" "$O/app" "$O/D2RMobile-shell-build-input.zip" "$O/shell_manifest.txt" && mkdir -p "$W" "$O/ref" || die "建不了 $O"
 rsync -a --exclude '/ios/Gen' --exclude '/ios/DmIOS.xcodeproj' --exclude '.iosdd*' --exclude '/ios/local.env' "$SRC/" "$W/dm/" || die "拷源码树失败"
@@ -29,11 +29,6 @@ rsync -a --exclude '/ios/Gen' --exclude '/ios/DmIOS.xcodeproj' --exclude '.iosdd
 printf 'DM_TEAM_ID=0000000000\nDM_BUNDLE_ID=org.d2rmobile.app\nDM_FREE_ACCOUNT=1\n' > "$O/shell.env"; export DM_LOCAL_ENV=$O/shell.env DM_FREE_ACCOUNT=1 DM_ROOT=$ROOT
 cd "$W/dm/ios" || die "副本里没有 dm/ios"
 t "生成（与平时出包同一步：用本机游戏文件）"; DM_GEN_ONLY=1 DM_IOS_DD="$DD" bash run.sh build > "$O/gen.log" 2>&1 || { tail -5 "$O/gen.log"; die "生成失败，日志 $O/gen.log"; }
-# iOS17 direct-install shell: preserve all sources, use native PNG icons.
-python3 tools/project_free.py project.yml project_icons_free.yml || die "free project generation failed"
-python3 tools/ios17_png_icons.py project_icons_free.yml project_icons.yml Assets.xcassets/AppIcon.appiconset/AppIcon1024.png Gen/AppIcons || die "PNG icon generation failed"
-xcodegen generate -q --spec project_icons.yml || die "PNG project generation failed"
-python3 -c 'from pathlib import Path; [Path(p).unlink() for p in ("project_icons_free.yml", "project_icons.yml")]'
 # 三份编进代码的表：真实数据留作对照，源文件换成替身
 # The three tables compiled into the code: the real data is kept as reference, and the source files are replaced with stubs
 python3 tools/shell_stubs.py data "$W/dm" "$O/ref/derived.tsv" || die "拆表失败"
@@ -48,15 +43,11 @@ grep -q -- '-DDM_SHELL' Gen/dm.xcconfig && ! grep -q segprot Gen/dm.xcconfig || 
 # 真机用的壳同时面向 iPhone 与 iPad（设备族是构建设置，要作为命令行参数传）；Mac 变体不传，窗口与坐标换算照开发包
 # The device shell targets both iPhone and iPad (device family is a build setting and must be passed as a command-line argument); the Mac variant does not pass it, and its window and coordinate mapping follow the dev build
 if [ "$KIND" = mac ]; then DEST='platform=macOS,arch=arm64,variant=Designed for iPad'; PROD=Release-iphoneos; FAM=; else DEST='generic/platform=iOS'; PROD=Release-iphoneos; FAM=DM_DEVICE_FAMILY=1,2; fi
-# Direct device SDK target avoids Xcode destination lookup requiring another iOS platform download.
-if [ "$KIND" = ios ]; then XSEL=(-target DmIOS -sdk iphoneos -arch arm64); XOUT=("SYMROOT=$DD/Build/Products" "OBJROOT=$DD/Build/Intermediates.noindex"); else XSEL=(-scheme DmIOS -destination "$DEST"); XOUT=(-derivedDataPath "$DD"); fi
 t "构建（不签名）"
-xcodebuild -project DmIOS.xcodeproj "${XSEL[@]}" -configuration Release "${XOUT[@]}" \
-  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= "OTHER_CFLAGS=\$(inherited) -mcpu=apple-a16 -DDM_NVN_M3=1 -DDM_LEGACY_IOS17=1 -DDM_SHELL -ffile-prefix-map=$W=./src -ffile-prefix-map=$ROOT=./work" $FAM build > "$O/build.log" 2>&1 || { grep -E 'error:' "$O/build.log" | head -5; die "构建失败，日志 $O/build.log"; }
+xcodebuild -project DmIOS.xcodeproj -scheme DmIOS -configuration Release -destination "$DEST" -derivedDataPath "$DD" \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= $FAM build > "$O/build.log" 2>&1 || { grep -E 'error:' "$O/build.log" | head -5; die "构建失败，日志 $O/build.log"; }
 APP=$(ls -d "$DD"/Build/Products/Release-*/DmIOS.app 2> /dev/null | head -1); [ -d "$APP" ] || die "没找到构建出的 App"
 cp -R "$APP" "$O/app" || die "拷 App 失败"; A=$O/app
-# Remove debugger-only object paths; preserve runtime code and exported symbols.
-strip -S "$A/DmIOS" || die "strip debug metadata failed"
 # 壳里不该有的：凡是从游戏文件来的，一律搬到 ref/ 对照，并记进清单。下面这张表就是「衍生内容」的全部定义——
 # 往包里加新的衍生内容时要来这里登记，否则末尾的核对会把它当成壳的一部分发出去（核对：壳里不许出现清单外的大文件 / 图片）。
 # What must not be in the shell: anything that comes from the game files is moved to ref/ as reference and recorded in the manifest. The table below is the complete definition of "derived content" --
@@ -79,7 +70,7 @@ cp "$O/shell_manifest.txt" "$A/dm/shell_manifest.txt"
 # 着色器源码摘要与出壳这台机器的 spirv-cross 版本也随壳走：使用者的翻译工具版本不同、翻出来的源码不一样时，d2rm_pack.py 当场报出来
 # The shader source digest and the spirv-cross version of the machine that built the shell ship with the shell too: when the user's translator version differs and produces different sources, d2rm_pack.py reports it on the spot
 SD=$(python3 ../tools/d2rm_pack.py --src-digest "$ROOT/build/cache/metal_shader_cache/b-$V") && [ -n "$SD" ] || die "算不出着色器源码摘要"
-SCV=$(spirv-cross --revision 2>&1 | head -1 | sed -n 's/^Git commit: \([^ ]*\).*/\1/p')
+SCV=$(brew list --versions spirv-cross 2> /dev/null | awk '{print $2}')
 printf 'PRODUCT=%s\nCHAIN=%s\nKIND=%s\nSHADER_SRC=%s\nSPIRV_CROSS=%s\n' "$(head -1 ../PRODUCT)" "$V" "$KIND" "$SD" "${SCV:-unknown}" > "$A/dm/shell_info.txt"
 # 资源下载扩展：只有走苹果托管资源包的正式包才用；自签装机时扩展还要多占一个应用标识，壳里不带
 # Asset download extension: only release packages that go through Apple-hosted asset packs use it; when sideloading, the extension would also take up one more App ID, so the shell does not carry it

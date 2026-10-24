@@ -1,5 +1,3 @@
-> **本 fork 的 iOS17 预发布说明：** 使用本 fork 同一 Release 标签的源码和 `D2RMobile-shell-ios17-…-build-input.zip`。它是构建原料，不可直接安装；不会附带游戏程序/资源/着色器或完整ASTC。下文来自上游的其他机型测试数字不是本 fork 的 A16 验收；普通自签的内存权限也不能视为与巨魔相同。iOS17新壳的实机长期运行尚未认证。
-
 # 不用 Xcode 出安装包（试验性）
 
 平常的路是：在 Mac 上用 Xcode 把整个 App 构建出来（见首页「构建」一节）。这一页讲另一条路：我们事先构建好一个**不含任何游戏内容的「壳」安装包**，你用自己的游戏文件在自己的电脑上把内容做进去，再用常见的自签工具装到手机上。全程不需要用 Xcode 构建和签名，也不需要苹果的付费开发者账号。
@@ -17,7 +15,7 @@ English: [NO_XCODE.md](NO_XCODE.md)
 
 ## 壳里有什么、没有什么
 
-壳从本 fork 的[发布页](https://github.com/4ppp44/d2r-mobile-ios17/releases)下载：选择 `D2RMobile-shell-ios17-…-build-input.zip`，本预发布面向iOS17/A16实验性适配。务必使用同一发布标签的源码，而不是随时变化的分支。后面的本地生成步骤不变。
+壳从本仓库的[发布页](https://github.com/jhaizhou-ops/d2r-mobile/releases)下载。发布页上有两份：`D2RMobile-shell-build-input.zip` 给 iOS 26 及以上，`D2RMobile-shell-ios18-build-input.zip` 给 iOS 18 – 25（[OLDER_SYSTEMS.zh-CN.md](OLDER_SYSTEMS.zh-CN.md)），按手机的系统挑一份，后面的步骤相同。壳（约 4 MB）里只有我们自己的宿主程序、图标和两张随仓库公开的表。它**没有**：游戏程序、着色器、覆盖层、界面素材、任何从游戏文件生成的数据表。构建壳的脚本（`dm/ios/tools/shell_build.sh`）在最后会拿真实的游戏内容去壳里逐个文件搜一遍，搜到就不出壳。
 
 **壳是做安装包的原料，不能直接装来玩**（所以它是 `.zip`，不是 `.ipa`）。把它改名直接装上去，App 启动时会弹框「这个安装包还不能玩」，列出缺的内容，告诉你回到下面第一步；不会进游戏。
 
@@ -58,7 +56,7 @@ python3 dm/tools/d2rm_pack.py <D2RMobile-shell-build-input.zip> <你的游戏文
 
 用自签工具（如 Sideloadly、AltStore）打开上一步的 `输出.ipa`，登录你自己的 Apple ID，装到手机上。免费的 Apple ID 就可以，苹果对它的限制是：签名 7 天过期（到期重签重装，存档还在）、最多 3 台设备、每台最多 3 个 App。第一次装完要到「设置 → 通用 → VPN 与设备管理」里点一次信任；如果把它卸载了再装（而不是直接覆盖安装），系统会把信任撤掉，要再点一次（实测）。
 
-免费账号通常没有 iCloud 存档同步或巨魔环境的内存权限；不能承诺与巨魔环境的稳定性/性能相同。
+免费账号下没有 iCloud 存档同步，其余功能不受影响。
 
 ## 第三步：把游戏资源放进手机
 

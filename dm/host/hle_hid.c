@@ -9,6 +9,7 @@
 #include "dm_cursor_item.h"
 #include <unistd.h>
 #include "dm_input.h"
+#include "dm_motion.h"
 #include "front.h"
 #include <stdatomic.h>
 #include "dm_cursor.h"
@@ -417,6 +418,8 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     if (km & PK_LSL) s->lx = -32767; if (km & PK_LSR) s->lx = 32767;   // 脚本摇杆伪键：推满（Horizon 摇杆 ±32767，上为正） | script stick pseudo-keys: push to full (Horizon stick ±32767, up is positive)
     if (km & PK_LSU) s->ly = 32767;  if (km & PK_LSD) s->ly = -32767;
     s->attributes = ATTR_CONNECTED;
+    DM_MOTION(DM_MOTION_INPUT, dm_guest_frame(), 0, s->sampling, s->buttons,
+              s->lx, s->ly, s->rx, s->ry, s->attributes);
     atomic_store_explicit(&g_sampled_right,(uint32_t)s->rx|((uint64_t)(uint32_t)s->ry<<32),memory_order_release);
     receipt(s, id, style, km, read_start_ns);
 }

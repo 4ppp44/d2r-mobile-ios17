@@ -49,7 +49,22 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             o->nb++;
         }
         NSDictionary *dr = j[@"drv_reads"];
-        if ([dr isKindOfClass:[NSDictionary class]]) { o->drv_read[0] = dr[@"0"] != nil; o->drv_read[2] = dr[@"2"] != nil; }
+        if ([dr isKindOfClass:[NSDictionary class]]) {
+            for (int bank = 0; bank < 3; bank += 2) {
+                NSDictionary *e = dr[[NSString stringWithFormat:@"%d", bank]];
+                if (![e isKindOfClass:[NSDictionary class]]) continue;
+                o->drv_read[bank] = 1;
+                NSArray *ofs = e[@"vec4_offsets"];
+                if ([e[@"dynamic"] boolValue]) FAIL("驱动段 c%d 的读取下标是动态的，回放层填不了", bank);   // 出包侧 dmsh_build 已拒绝 dynamic；双保险 | The packaging side already rejects dynamic; belt and braces
+                if (![ofs isKindOfClass:[NSArray class]]) continue;
+                if (ofs.count > (sizeof o->drv_off[0] / sizeof o->drv_off[0][0])) FAIL("驱动段 c%d 读取偏移 %lu 个，超上限 %lu", bank, (unsigned long)ofs.count, (unsigned long)(sizeof o->drv_off[0] / sizeof o->drv_off[0][0]));
+                for (NSNumber *o2 in ofs) {
+                    int off = o2.intValue;
+                    if (off < 0 || off >= 0xA00 || off % 16) FAIL("驱动段 c%d 读取偏移 %#x 越界或不在 16 字节边界", bank, off);
+                    o->drv_off[bank][o->drv_noff[bank]++] = (uint16_t)off;
+                }
+            }
+        }
         NSArray *uf = j[@"drv_unfillable"];
         if ([uf isKindOfClass:[NSArray class]] && uf.count) FAIL("运行时读驱动段的回放层填不了的位置：%s", [[uf componentsJoinedByString:@" "] UTF8String]);
         NSString *c1 = j[@"c1"];

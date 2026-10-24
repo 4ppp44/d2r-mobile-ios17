@@ -42,7 +42,34 @@ class SlowframeTest(unittest.TestCase):
                              '[slowframe]\t#\t至帧 300\tjudged=290\tslow=8\t判据=上屏间隔\n')
         self.assertIn('宿主统计 可判 290 帧、掉帧 8 帧', report)
         self.assertNotIn('各段 慢帧 / 可判帧', report)
+    def test_target_budget_30fps_normal_and_drop(self):
+        rows = (
+            '1\t@target_frame_ms\t33.333333\n1\t@presented_ms\t33.36\n'
+            '2\t@target_frame_ms\t33.333333\n2\t@presented_ms\t45.0\n'
+            '3\t@target_frame_ms\t33.333333\n3\t@presented_ms\t55.0\n'
+        )
+        report = self.report(rows)
+        self.assertIn('可判 3 帧', report)
+        self.assertIn('未分段 1/3', report)
 
+    def test_target_budget_60fps_drops_33ms(self):
+        rows = (
+            '1\t@target_frame_ms\t16.667\n1\t@presented_ms\t16.68\n'
+            '2\t@target_frame_ms\t16.667\n2\t@presented_ms\t25.0\n'
+            '3\t@target_frame_ms\t16.667\n3\t@presented_ms\t33.36\n'
+        )
+        report = self.report(rows)
+        self.assertIn('可判 3 帧', report)
+        self.assertIn('未分段 1/3', report)
+
+    def test_target_switch_boundary(self):
+        rows = (
+            '1\t@target_frame_ms\t16.667\n1\t@presented_ms\t33.36\n'
+            '2\t@target_frame_ms\t33.333\n2\t@presented_ms\t33.36\n'
+        )
+        report = self.report(rows)
+        self.assertIn('可判 2 帧', report)
+        self.assertIn('未分段 1/2', report)
 
 if __name__ == '__main__':
     unittest.main()

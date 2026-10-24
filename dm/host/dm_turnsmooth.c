@@ -38,6 +38,7 @@
 // DM_TEST_YAW_MIN=<degrees per second> / DM_TEST_YAW_SET="<offset in hex>=<value>[,...]" try other values; DM_TEST_YAW_TRACE=1 logs one line of yaw per frame.
 #include "dm.h"
 #include "hle.h"
+#include "dm_motion.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -77,6 +78,8 @@ static void ts_obs(const uint64_t *regs) {
         if (g_p.ok && g_p.moving && !moving) { cnt = 30; LOG("转向平滑：停步这一帧误差 (%.0f,%.0f)", *ex, *ey); }
         else if (cnt > 0 && --cnt == 0) LOG("转向平滑：停步后第 30 帧误差 (%.0f,%.0f)，在走 %d", *ex, *ey, moving); }
     if (g_trace) LOG("转向帧迹 %d %d %.0f %.0f %d %.3f %.3f", x, y, *ex, *ey, moving, tau, frame);   /* 外推坐标、将加回的误差：画出来的位置 = 两者之和 | extrapolated coordinates and the error about to be added back: the drawn position = the sum of the two */
+    DM_MOTION(DM_MOTION_CLIENT, dm_guest_frame(), 0, *(uint32_t *)(uintptr_t)(pl + 8),
+              *(uint32_t *)(uintptr_t)(pl + 0xc), x, y, *ex, *ey, moving, tau, frame, dx, dy);
     g_p.path = pp; g_p.ok = 1; g_p.moving = moving; g_p.x = x; g_p.y = y; g_p.dx = dx; g_p.dy = dy; g_p.tau = tau;
 }
 
@@ -97,6 +100,7 @@ static void yaw_obs(const uint64_t *regs) {   /* x1 = 参数块：+8 组件，+0
     if (g_yaw_min > 0) w[4] = w[6] = g_yaw_min;
     for (int i = 0; i < g_nset; i++) *(float *)(uintptr_t)(comp + g_set[i].off) = g_set[i].v;
     if (g_yaw_trace) LOG("转身帧迹 %.1f %.4f %.4f", guest_ns() / 1e6, w[1], w[2]);   /* 客体时钟毫秒、身体偏航、平滑偏航（弧度） | guest clock in milliseconds, body yaw, smoothed yaw (radians) */
+    DM_MOTION(DM_MOTION_YAW, dm_guest_frame(), 0, *(uint32_t *)(uintptr_t)(unit + 8), w[1], w[2]);
 }
 
 void dm_turnsmooth_install(uint8_t *main_base) {
