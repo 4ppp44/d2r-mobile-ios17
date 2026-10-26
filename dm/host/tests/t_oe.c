@@ -100,9 +100,9 @@ static void test_scale3d(void) {
     CHECK(s3_n(299, D60) == 1 && s3_n(1, D60) == 2, "快降：停判后历史清空，再满 5 窗 → 降到 2 档");
     s3_hold_pass();
     CHECK(s3_n(3000, D60) == 2, "下限：已到第 2 档（max_level），再掉也不动");
-    // 档位表：缺省下限见 S3_FLOOR_DEF（20261024 真机扫档定为 0.55）；显式 0.60 / 0.85 档位不变
-    // Level table: the default floor is S3_FLOOR_DEF (0.55 per the 20261024 device sweep); explicit floors of 0.60 / 0.85 keep the same levels
-    CHECK(s3_max_level(0.75f, S3_FLOOR_DEF) == 4 && s3_level_scale(0.75f, 4) == 0.55f, "档位：缺省下限 0.55（20261024 真机扫档）→ 配置 0.75 最深第 4 档");
+    // 档位表：缺省下限见 S3_FLOOR_DEF（20261025 本机扫档定为 0.60）；显式 0.55 / 0.85 档位不变
+    // Level table: the default floor is S3_FLOOR_DEF (0.60 per the 20261025 local sweep); explicit floors of 0.55 / 0.85 keep the same levels
+    CHECK(s3_max_level(0.75f, S3_FLOOR_DEF) == 3 && s3_level_scale(0.75f, 3) == 0.60f, "档位：缺省下限 0.60（20261025 本机扫档）→ 配置 0.75 最深第 3 档");
     CHECK(s3_max_level(0.75f, 0.60f) == 3 && s3_level_scale(0.75f, 0) == 0.75f && s3_level_scale(0.75f, 1) == 0.70f && s3_level_scale(0.75f, 3) == 0.60f, "档位：配置 0.75 → 0.70 / 0.65 / 0.60，最深第 3 档");
     CHECK(s3_max_level(0.85f, 0.60f) == 5 && s3_level_scale(0.85f, 1) == 0.80f && s3_level_scale(0.85f, 2) == 0.75f && s3_level_scale(0.85f, 5) == 0.60f, "档位：配置 0.85 → 0.80 / 0.75 / 0.70 / 0.65 / 0.60，最深第 5 档");
     // 慢降：每窗 3 帧掉帧 + 114 帧正常（3 × 33.4 + 114 × 16.6667 = 2000.2 ms，一窗 117 帧，掉帧率 2.56%）
@@ -161,6 +161,40 @@ static void test_scale3d(void) {
     int a = s3_replay(0), b = s3_replay(1);
     printf("  （实玩第二段回放：慢帧均匀散开换级 %d 次，挤在一起换级 %d 次）\n", a, b);
     CHECK(a == 0 && b == 0, "动态比例：实玩第二段的慢帧序列（帧率 59+）不论散开还是挤在一起都不换级");
+    // GPU 门槛（build 2026102409 真机日志）：掉帧只在 GPU 真吃紧时才值得降分辨率
+    // GPU gate (build 2026102409 device log): dropping the render scale is only worth it when the GPU is genuinely short
+    // 预算 16.67 ms：GPU 均值 10 ms = 60% 有余量，20 ms = 120% 吃紧
+    // Budget 16.67 ms: a 10 ms GPU mean is 60% (headroom), 20 ms is 120% (short)
+    s3 = (scale3d_ctl){.max_level = 4, .gpu_ms = 10.0}; s3_now = 9000 * S3_SEC;
+    CHECK(s3_n(3000, D60) == 0, "GPU 有余量（10/16.67 ms）时持续全掉帧 → 不降档（掉帧来自客体 CPU，降分辨率救不了）");
+    s3 = (scale3d_ctl){.max_level = 4, .gpu_ms = 20.0}; s3_now = 9500 * S3_SEC;
+    CHECK(s3_n(300, D60) == 1, "GPU 吃紧（20/16.67 ms）时掉帧 → 照常降档");
+    // 死区：65%–75% 之间既不降也不提前升 | Dead band: between 65% and 75% it neither lowers nor raises early
+    s3 = (scale3d_ctl){.max_level = 4, .gpu_ms = 11.5}; s3_now = 10000 * S3_SEC;   // 69%
+    CHECK(s3_n(3000, D60) == 0, "GPU 在死区（69%）且掉帧 → 不降档");
+    // 低档时 GPU 明显有余量：不必等 30 秒干净窗，2 秒一判就往回升 | At a low level with clear GPU headroom: no need to wait for a 30 s clean streak, it climbs every 2 s
+    s3 = (scale3d_ctl){.max_level = 4, .level = 4, .gpu_ms = 9.0}; s3_now = 10500 * S3_SEC;
+    CHECK(s3_n(120, F60) == 4, "低档 + GPU 有余量：一窗（2 秒）还不够，先不动");
+    CHECK(s3_n(120, F60) == 3, "低档 + GPU 有余量：满两窗 → 升一档（低分辨率没换来任何东西）");
+    // 一路升回 0 档，且不必 30 秒 | Climbs all the way back to level 0, without needing 30 s per step
+    s3_hold_pass(); CHECK(s3_n(240, F60) == 2, "继续升到 2 档");
+    s3_hold_pass(); CHECK(s3_n(240, F60) == 1, "继续升到 1 档");
+    s3_hold_pass(); CHECK(s3_n(240, F60) == 0, "升回配置值 0 档");
+    // 持续 CPU 慢帧，旧历史仍请求降档：GPU 有余量必须能回升，不能被提前 return 卡住。
+    // Persistent CPU stalls with stale drop history must not block a GPU-headroom recovery.
+    s3 = (scale3d_ctl){.max_level = 4, .level = 3, .gpu_ms = 9.0, .nw = 5}; s3_now = 10800 * S3_SEC;
+    for (int i = 0; i < 5; i++) { s3.wn[i] = 60; s3.wd[i] = 60; }
+    CHECK(s3_n(120, D60) == 2, "持续慢帧 + 降档历史 + GPU 有余量：4 秒后仍能升档");
+    // 升档失败后回落的低分辨率 GPU 虽有余量，也不能绕过 90 秒防抖。
+    // A failed upscale must keep its retry delay even if the lower scale has GPU headroom.
+    s3 = (scale3d_ctl){.max_level = 4, .level = 1, .gpu_ms = 20.0, .last_up = s3_now};
+    CHECK(s3_n(300, D60) == 2 && s3.need_good == 45, "升档后 GPU 超载：降回并保留 90 秒重试间隔");
+    s3_hold_pass(); s3.gpu_ms = 9.0;
+    CHECK(s3_n(120 * 44, F60) == 2, "低档 GPU 有余量仍不绕过升档失败的冷却");
+    CHECK(s3_n(120, F60) == 1, "90 秒后才重试升档");
+    // 无 GPU 读数（平台不给计时）：退回旧规则，与改动前一致 | No GPU reading (the platform provides no timing): the old rule applies, as before the change
+    s3 = (scale3d_ctl){.max_level = 4, .gpu_ms = 0}; s3_now = 11000 * S3_SEC;
+    CHECK(s3_n(300, D60) == 1, "无 GPU 读数：掉帧照旧降档（旧规则不变）");
 }
 static void test_feed_panel_guard(void) {
     g_test_panel = 1;

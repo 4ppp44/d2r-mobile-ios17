@@ -184,7 +184,7 @@ static float s3_cfg(void) {
         cfg = v; }
     return cfg;
 }
-#define S3_FLOOR_DEF 0.55f   // 20261024 真机扫档（artifacts/stutter-2402-20261024/frida-3dscale-ab.txt）：重战斗 0.60 档 GPU 仍 18–20.5 ms 超 16.7 预算（p95 上屏 34 ms），放宽一档 0.55 | 20261024 device level sweep: in heavy combat at 0.60 the GPU still runs 18-20.5 ms over the 16.7 ms budget (p95 present interval 34 ms), so one more level, 0.55, is allowed
+#define S3_FLOOR_DEF 0.60f   // 20261025 本机实测（artifacts/local-perf-20261025/scale055..scale075）：同一固定种子场景 0.55 与 0.60 的 GPU p95 12.60/12.62 ms、上屏 59.69/59.59 帧、丢弃 8/6，0.60 在本机不付代价；0.55 观感明显更糊，用户不接受，故下限抬到 0.60。0.65 本机也可跑（GPU p95 12.33 ms），但 20261024 真机扫档里重战斗 0.60 档仍 18–20.5 ms 超预算，0.65 风险更高，留作 DM_3D_SCALE_FLOOR 显式选择 | 20261025 local runs on one fixed-seed scene: 0.55 and 0.60 both give GPU p95 12.60/12.62 ms, 59.69/59.59 presented fps and 8/6 discards, so 0.60 costs nothing here and 0.55 looks visibly blurrier (user rejects it), hence the floor moves to 0.60. 0.65 also runs locally (GPU p95 12.33 ms), but the 20261024 device sweep still saw 18-20.5 ms at 0.60 in heavy combat, so 0.65 stays an explicit DM_3D_SCALE_FLOOR choice.
 
 // 纯函数控制器（单测 t_oe.c 直接喂序列）：level 0 = 配置值，越大越低。判据只认实际上屏：
 //   掉帧 = 上屏间隔 > 1.5 × 目标周期（60 帧时 25 ms），或被系统丢弃（−1）；每 2 秒一个窗，记窗内帧数与掉帧数，留最近 30 窗（60 秒）。
@@ -200,8 +200,15 @@ static float s3_cfg(void) {
 // A run of consecutive dropped frames counts only its first 3, unless the run lasts 1 s (from then on every frame counts): one-off stalls such as a
 // screenshot, a save or a system notification are not helped by a lower resolution; sustained load (long runs, or frequent short ones) still counts.
 // Old rule (lower only when the window frame rate < target × 0.92, only two levels 0.72 / 0.70) bottomed out at 0.70 in heavy scenes, and warm steady state still dropped 12.6% (Hc run).
+//
+// GPU 门槛只阻止无效降档；不能证明所有掉帧都来自 CPU。GPU 时间是命令缓冲时长之和，可能包含重叠。
+// 有余量时可在持续慢帧中恢复画质；刚升又降则保留 90 秒冷却，避免同一负载反复升降。
+// The GPU gate prevents ineffective scale cuts; it does not attribute every dropped frame to CPU.
+// GPU timings sum command-buffer spans and may overlap. Recover quality despite CPU stalls when there
+// is GPU headroom, but keep the 90-second retry delay after a failed upscale.
 typedef struct { int level, max_level; double period_ms; uint64_t hold_until, last_up; double win_ms; unsigned win_n, win_d;
-                 uint16_t wn[30], wd[30]; int nw; int good_run, need_good; double last_r10, last_r60; unsigned run_n; double run_ms; } scale3d_ctl;
+                 uint16_t wn[30], wd[30]; int nw; int good_run, need_good; double last_r10, last_r60; unsigned run_n; double run_ms;
+                 double gpu_ms; } scale3d_ctl;   // gpu_ms：最近一次 GPU 帧耗时均值，−1 = 无读数 | most recent mean GPU frame time, −1 = no reading
 #define S3_SEC 1000000000ull
 // 连续掉帧：只计前 S3_BURST_FRAMES 帧，连续满 S3_BURST_MS 之后才每帧都计
 // Runs of dropped frames: only the first S3_BURST_FRAMES count until the run has lasted S3_BURST_MS
@@ -213,6 +220,13 @@ static void scale3d_ctl_hold(scale3d_ctl *c, uint64_t now, uint64_t ns) {   // �
 }
 static double s3_rate(const scale3d_ctl *c, int k) {   // 最近 k 窗的掉帧率（窗不足 k 个按已有的算；没有窗返回 0） | Dropped-frame rate over the last k windows (fewer than k windows: compute over those present; no windows returns 0)
     unsigned n = 0, d = 0; for (int i = 0; i < k && i < c->nw; i++) { n += c->wn[i]; d += c->wd[i]; } return n ? (double)d / n : 0;
+}
+// GPU 压力：>0 = 有读数（均值 ms）；≤0 = 平台不给 GPU 计时 | GPU pressure: >0 = a reading is available (mean ms); <=0 = the platform provides no GPU timing
+//   判据用预算的百分比：预算 = 目标周期 | The criterion is a fraction of the budget, and the budget is the target period
+static int s3_gpu_bound(const scale3d_ctl *c, int up) {
+    if (c->gpu_ms <= 0) return 1;   // 无读数：退回旧规则（掉帧就降） | no reading: fall back to the old rule (lower on drops)
+    double per = c->period_ms > 0 ? c->period_ms : 1000.0 / 60;
+    return c->gpu_ms >= (up ? 0.65 : 0.75) * per;
 }
 static int scale3d_ctl_step(scale3d_ctl *c, double iv_ms, uint64_t now) {   // 返回当前级 | returns the current level
     if (now < c->hold_until || iv_ms == 0) return c->level;   // 停判中 / 无读数（0） | Judging paused / no reading (0)
@@ -228,11 +242,20 @@ static int scale3d_ctl_step(scale3d_ctl *c, double iv_ms, uint64_t now) {   // �
     c->wn[0] = (uint16_t)c->win_n; c->wd[0] = (uint16_t)c->win_d; if (c->nw < 30) c->nw++;
     int clean = c->win_d == 0; c->win_ms = 0; c->win_n = c->win_d = 0;
     c->last_r10 = s3_rate(c, 5); c->last_r60 = c->nw >= 30 ? s3_rate(c, 30) : 0;
-    if (c->level < c->max_level && ((c->nw >= 5 && c->last_r10 > 0.05) || (c->nw >= 30 && c->last_r60 > 0.015))) {
-        if (c->last_up && now - c->last_up < 15 * S3_SEC) c->need_good = 45;   // 刚升上去 15 秒内又掉：下次升要 90 秒 | Dropped again within 15 s of being raised: the next raise needs 90 s
+    int want_down = (c->nw >= 5 && c->last_r10 > 0.05) || (c->nw >= 30 && c->last_r60 > 0.015);
+    if (want_down && c->level < c->max_level && s3_gpu_bound(c, 0)) {
+        if (c->last_up && now - c->last_up < 15 * S3_SEC) c->need_good = 45;
         c->level++; scale3d_ctl_hold(c, now, 3 * S3_SEC); return c->level;
     }
-    if (clean) { if (++c->good_run >= (c->need_good ? c->need_good : 15) && c->level > 0) { c->level--; c->last_up = now; c->need_good = 0; scale3d_ctl_hold(c, now, 3 * S3_SEC); } }
+    // 升档：连续干净窗满 15 个（30 秒）；或 GPU 明明有余量却还停在低档——低分辨率没换来任何东西，2 窗（4 秒）就往回升一档
+    // Raise: 15 consecutive clean windows (30 s); or the GPU clearly has headroom while the level is still low - the lower scale is buying nothing, so one level back up every 2 windows (4 s)
+    if (c->level > 0) {
+        int need = c->need_good ? c->need_good : s3_gpu_bound(c, 1) ? 15 : 2;
+        if (clean || !s3_gpu_bound(c, 1)) {
+            if (++c->good_run >= need) { c->level--; c->last_up = now; c->need_good = 0; c->good_run = 0; scale3d_ctl_hold(c, now, 3 * S3_SEC); }
+        }
+        else c->good_run = 0;
+    }
     else c->good_run = 0;
     return c->level;
 }
@@ -292,9 +315,16 @@ void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_per
     { int mtl_fps_target(void); double mtl_display_refresh(void), dm_pace_hz(double, double), r = mtl_display_refresh(), hz = dm_pace_hz(r, 60);
       double p = mtl_fps_target() == 30 ? 1000.0 / dm_pace_hz(r, 30) : hz != 60 ? 1000.0 / hz : 0; if (p != c.period_ms) { c.period_ms = p; scale3d_ctl_hold(&c, now, 2 * S3_SEC); } }   // 目标周期跟着出图帧率换（省电 30 帧、非 60 倍数的屏取整除档，如 144 Hz 屏 72），切换后停判 2 秒 | The target period follows the present frame rate (power saving 30 fps; screens not a multiple of 60 take the evenly dividing tier, e.g. 72 on a 144 Hz screen); checking pauses for 2 seconds after a switch
     if (inj0 >= 0) { long f = (long)dm_nvn_frame_count(); double per = c.period_ms > 0 ? c.period_ms : 1000.0 / 60; iv_ms = f >= inj0 && f <= inj1 ? 2 * per : per; }   // 注入：段内每帧当掉一帧（两个周期） | Injection: every frame within the segment counts as a dropped frame (two periods)
+    // 测试开关 DM_NO_GPU_GATE=1：当成「平台不给 GPU 读数」，走改动前的旧规则（掉帧就降）。只用于同机 A/B 对照，
+    // 让「GPU 门槛」这一项的影响能被单独量出来，不必换包。
+    // Test switch DM_NO_GPU_GATE=1: behave as if the platform provides no GPU reading, i.e. the pre-change rule (lower on any drop). For same-machine A/B only,
+    // so the effect of the GPU gate alone can be measured without swapping builds.
+    if (getenv("DM_NO_GPU_GATE")) c.gpu_ms = -1;
+    else c.gpu_ms = xbg_recent_gpu_ms ? xbg_recent_gpu_ms() : -1;
     int was = c.level, lv = scale3d_ctl_step(&c, iv_ms, now);
-    if (lv != was) LOG("3D 比例控制：最近 10 秒掉帧 %.1f%%、60 秒 %.1f%% → %s到第 %d 档（3D 比例 %.2f）%s", c.last_r10 * 100, c.last_r60 * 100, lv > was ? "降" : "升", lv,
-                       s3_level_scale(s3_cfg(), lv), c.need_good ? "（刚升又掉：下次升档要 90 秒）" : "");
+    if (lv != was) LOG("3D 比例控制：最近 10 秒掉帧 %.1f%%、60 秒 %.1f%%、GPU %.1f ms（预算 %.1f）→ %s到第 %d 档（3D 比例 %.2f）%s", c.last_r10 * 100, c.last_r60 * 100,
+                       c.gpu_ms, c.period_ms > 0 ? c.period_ms : 1000.0 / 60, lv > was ? "降" : "升", lv, s3_level_scale(s3_cfg(), lv),
+                       c.need_good ? "（刚升又掉：下次升档要 90 秒）" : "");
     atomic_store(&g_scale3d_level, lv);
 }
 void dm_3d_scale_hot(int hot) { (void)hot; }   // 过热不再直接降档（改按实际掉帧）；保留符号给前端 | overheating no longer lowers the level directly (now by actual dropped frames); the symbol is kept for the front end

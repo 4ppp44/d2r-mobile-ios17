@@ -1618,7 +1618,8 @@ uint64_t front_blank_presents(void) { return g_link_blank?[g_link_blank presente
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = dr.texture; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(50 / 255.0, 50 / 255.0, 50 / 255.0, 1);
-        id<MTLCommandBuffer> cb = [_q commandBuffer]; [[cb renderCommandEncoderWithDescriptor:rp] endEncoding]; [dr addPresentedHandler:^(id<MTLDrawable> shown){ if(shown.presentedTime>0)atomic_fetch_add_explicit(&g_blank_n,1,memory_order_relaxed); }];
+        id<MTLCommandBuffer> cb = [_q commandBuffer]; [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+        [dr addPresentedHandler:^(id<MTLDrawable> shown){ if(shown.presentedTime>0)atomic_fetch_add_explicit(&g_blank_n,1,memory_order_relaxed); }];
         [cb presentDrawable:dr]; [cb commit];
     }
 }

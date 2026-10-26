@@ -12,6 +12,11 @@
 void tact_prefetch_stop(void);
 void granny_prof_dump(void);
 void hlecount_flush(void);
+// 日志环形缓冲的 flush 只存在于 iOS 壳（ios/Sources/main.m 的 dm_log_ring）；Mac 宿主的 diag.c 是同步写盘，没有环形缓冲，
+// 所以这里补一个空实现：既让 Mac 宿主的链接闭合，又保持 iOS 那份强定义优先（同一符号两个定义会冲突，故用弱定义）。
+// The log ring's flush only exists in the iOS shell (dm_log_ring in ios/Sources/main.m); the Mac host's diag.c writes synchronously and has no ring,
+// so this empty definition closes the Mac host's link while letting the iOS strong definition win (two strong definitions of one symbol would clash, hence weak).
+__attribute__((weak)) int dm_log_flush(unsigned timeout_ms) { (void)timeout_ms; return 1; }   // 同步写盘：写时已经落盘，没有要等的东西 | synchronous writes: already on disk, nothing to wait for
 extern int dm_log_flush(unsigned timeout_ms) __attribute__((weak_import));
 void dm_host_shutdown(const char *why) {
     static _Atomic int once; if (atomic_exchange(&once, 1)) return;

@@ -90,8 +90,8 @@ run: t_nvn t_dirty_slots t_builtin t_deswz_gpu t_pace t_pres_drop t_refl t_hmap 
 	DM_NVN_UNWRITTEN_DC=0 MTL_DEBUG_LAYER=1 ./t_rt_range --small-depth
 	DM_NVN_UNWRITTEN_DC=0 MTL_DEBUG_LAYER=1 ./t_rt_range --sample-attachment --both-flags
 	./t_pso_skey
-	for mode in shared changed ubo new_encoder dirty aba epoch; do ./t_stage_reuse $$mode || exit 1; done
-	for mode in repeat no_future other merged harvest slot_fail scissor publication; do ./t_pso_predict_dedup $$mode || exit 1; done
+	for mode in shared changed ubo new_encoder dirty aba epoch texsmp xpass; do ./t_stage_reuse $$mode || exit 1; done
+	for mode in repeat no_future other merged harvest slot_fail scissor publication schedule running; do ./t_pso_predict_dedup $$mode || exit 1; done
 	MTL_DEBUG_LAYER=1 ./t_pfv
 	MTL_DEBUG_LAYER=1 ./t_rt_srgb_view
 	MTL_DEBUG_LAYER=1 ./t_tex_finalize

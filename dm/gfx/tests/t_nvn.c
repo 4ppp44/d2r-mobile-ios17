@@ -442,9 +442,26 @@ int main(void) {
     EXPECT("未实现函数被调用后记为已报红", 1, g_unimpl_seen[ui] > 0);
     EXPECT("未实现函数计数 2", 2, nvn_slot[ui].cnt);
 
-    // 8. 诊断冒烟：拓扑探测与翻译细项日志（真实生产路径，无实现镜像断言）
+    // 8. DRS 读到的近 60 帧 GPU 均值：直接测生产函数——窗口滚动、无效样本、样本不足与过期
+    // 8. The ~60-frame GPU mean DRS reads: exercise the production functions directly — window rollover, invalid samples, too few samples, expiry
+    atomic_store(&g_hn, 0); g_gpu_ctl_sum = 0; atomic_store(&g_gpu_ctl_mean_ns, 0); atomic_store(&g_gpu_ctl_at, 0);
+    for (int i = 0; i < 7; i++) gpu_recent_push(10);
+    EXPECT("GPU 均值：不足 8 帧时无读数", -1, (long long)xbg_recent_gpu_ms());
+    gpu_recent_push(10);
+    EXPECT("GPU 均值：满 8 帧后为 10 ms", 10, (long long)xbg_recent_gpu_ms());
+    gpu_recent_push(NAN); gpu_recent_push(-3);
+    EXPECT("GPU 均值：NaN 与负值不入窗", 10, (long long)xbg_recent_gpu_ms());
+    for (int i = 0; i < 60; i++) gpu_recent_push(20);
+    EXPECT("GPU 均值：窗口满后按最近 60 帧算", 20, (long long)xbg_recent_gpu_ms());
+    gpu_recent_push(80);
+    EXPECT("GPU 均值：第 61 帧挤掉最早一帧（(59×20+80)/60）", 21, (long long)xbg_recent_gpu_ms());
+    atomic_store(&g_gpu_ctl_at, now_ns() - 600000000ull);
+    EXPECT("GPU 均值：0.5 秒无新帧即过期", -1, (long long)xbg_recent_gpu_ms());
+    atomic_store(&g_gpu_ctl_at, now_ns() + 600000000ull);
+    EXPECT("GPU 均值：时间戳在未来按无数据处理", -1, (long long)xbg_recent_gpu_ms());
+
+    // 9. 诊断冒烟：拓扑探测与翻译细项日志（真实生产路径，无实现镜像断言）
     atomic_fetch_add(&g_cum_sub_instr, 1000);
-    atomic_fetch_add(&g_cum_sub_cyc, 2000);
     atomic_fetch_add(&g_cum_sub_cpu_ns, 1000000);
     tsummary(1);
     atomic_fetch_add(&g_cum_sub_instr, 10000);

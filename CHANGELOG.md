@@ -2,6 +2,36 @@
 
 This log describes this experimental iOS17 fork, not upstream release promises. Build labels identify local integration baselines; they do not imply a public playable IPA.
 
+## [1.0.18-ios17-build2026102501] — 2026-10-25
+
+Cumulative updates across builds 2026102409, 2026102410, and 2026102501.
+
+### Added
+- **GPU-Gated Dynamic 3D Scale (DRS) Controller** (build 2026102410 & 2026102501).
+  - Implemented `xbg_recent_gpu_ms` and `nvn_gpu_recent_mean()` in `hle_nvn.c`: replaced the hardcoded `-1.0` stub with real Metal per-frame GPU execution durations.
+  - O(1) 60-frame rolling window calculation with 0.5 s expiration and NaN/negative rejection.
+  - Controller downscales only when mean GPU time exceeds 75% of the frame budget (12.5 ms for 60 fps). When frames drop due to host CPU load while the GPU has headroom, resolution is locked and will not falsely degrade.
+  - Early quality recovery: climbs one level back up every 4 seconds when GPU headroom exists, rather than waiting for 30 seconds of zero-drop windows.
+  - Persistent-CPU-stall resilience and 90-second upscale retry cooldown to prevent scale oscillations.
+- **Speculative Pipeline Compilation Throttling & Priority Yielding** (build 2026102501).
+  - Background speculative PSO worker threads capped at 2 (`PSO_PEND_MAX_WORKERS = 2`).
+  - Speculative compile workers immediately yield/pause when the presentation thread initiates a synchronous pipeline state compilation (`pso_pend_pause` / `pso_pend_resume`), eliminating multi-hundred-millisecond presentation stalls.
+- **Cross-Pass Argument Block Reuse** (build 2026102409).
+  - Extended argument buffer reuse across render passes within the same command submission (`ab_sub == g_sub_serial && !ab_ui_patched && memcmp`).
+  - Automatically replays resource usage declarations for Metal 3 encoders across passes.
+
+### Changed
+- **Default Dynamic 3D Scale Floor Raised to 0.60** (build 2026102501).
+  - Baseline floor raised from 0.55 back to 0.60 default (`S3_FLOOR_DEF = 0.60f`), eliminating blurriness reported by users.
+  - Enabled by the GPU-gated controller, which prevents unnecessary descent into low-resolution states during CPU-bound scenes. 0.55 and 0.65 remain selectable via `DM_3D_SCALE_FLOOR`.
+
+### Validation
+- Unit test coverage:
+  - `t_oe` test suite expanded to 68/68 passed (verifying GPU gate, early recovery, failed-upscale cooldown, and 0.60 default floor).
+  - `t_nvn` test suite expanded to 82/82 passed (verifying 60-frame rolling mean, rollover arithmetic, and 0.5 s expiration).
+  - `t_pso_predict_dedup` passed 10/10 modes with real Metal shader compilation and pixel readback.
+- Packaged build: `releases/D2R-iOS17-v1.0.18-build2026102501.ipa` (146,077,977 bytes, SHA-256 `ee48e8c57afce22f0c6c0a4029e3ed212fe56345e59a593961fca179c12aa7c3`).
+
 ## [1.0.18-ios17-build2026102408] — 2026-10-24
 
 Version bump to 1.0.18; the runtime source is the device-verified build 2026102406 state (the 2407/2408 labels differ only in the embedded version string).

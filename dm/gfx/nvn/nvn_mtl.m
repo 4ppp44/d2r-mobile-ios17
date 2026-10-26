@@ -1653,6 +1653,7 @@ static struct { uint32_t valid; MTLViewport vp; MTLScissorRect sc; int cull, win
 static int g_enc_vis, g_enc_has_vis;   // 本编码器当前的可见性计数模式（0 关 / 槽号 + 1）、是否挂了可见性缓冲 | This encoder's current visibility count mode (0 off / slot number + 1), and whether a visibility buffer is attached
 static int g_pso_dirty = 1, g_dss_dirty = 1;   // 回放中改了管线 / 深度模板相关状态 | Pipeline / depth-stencil related state was changed during replay
 static uint64_t g_stat_args_enc, g_stat_args_reuse;   // 参数缓冲：新编 / 复用次数 | Argument buffer: new-encode / reuse counts
+static uint64_t g_stat_args_m3_replay;   // 跨通道复用时重放的 useResource 声明条数（单测断言用；真机据此看复用是否真的带着声明） | Number of useResource declarations replayed on cross-pass reuse (asserted by unit tests; on device this shows whether reuse really carries its declarations)
 static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;   // 带宽账：附件读入 / 写出字节、全量读写通道数 | Bandwidth ledger: attachment load / store bytes, number of full load-store passes
 // DM_NVN_PASSDUMP：逐条记通道附件 / 采样 / 出图（贴图按序号），供离线做数据流分析；P / D / R / S 行的通道号一致（= 开通道后的 g_stat_pass）
 // DM_NVN_PASSDUMP=帧号 或 起-止（含两端）
@@ -2370,8 +2371,19 @@ static void shmap_load(void) {
 @interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     // 上次编好的参数缓冲
     // The argument buffer encoded last time
-    id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass, ab_token;
-    int8_t zf_state, zf_nf; zskip_fact zf;   // 全零跳过事实表的查表结果缓存（0 未查 / 1 无 / 2 有）；键不变，表长（单测可增补）没变就不重查   // ab_pass：编这块参数的渲染通道序号——只在同一通道内复用（跨通道 / 跨提交的块所在 arena 可能已回收重写） | Cached lookup result in the all-zero skip fact table (0 not looked up / 1 absent / 2 present); with the key unchanged and the table length (unit tests may append) unchanged, no re-lookup   // ab_pass: render pass index where this argument block was encoded; reused only within the same pass (across passes / submissions the arena holding the block may have been recycled and rewritten)
+    id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass, ab_sub, ab_token; int ab_valid;   // ab_valid：这块缓存确实编过（ab_sub 初值与提交序号同为 0，没有它首次就会假命中空绑定） | ab_valid: this cache really has been encoded (ab_sub starts at 0, same as the submission serial, so without it the very first call would falsely hit on empty bindings)
+    // 跨通道复用（同一次提交内）：块的字节在提交前不会变（arena 提交后才回收），但绑定的内容会——
+    // 复用前把编码时的原始绑定行（S 里的 ubo/ssbo/tex/samp/img，本阶段那份）逐字节比对，不同就重编。
+    // ui_patched：编码用了 ui_mat_patch 的环形拷贝（环形会回卷重写）——禁止跨通道复用。
+    // m3_res/m3_n：老接口在新编码器上要重放的 useResource 声明表。
+    // Cross-pass reuse (within one submission): the block's bytes cannot change before the submission commits (arenas are reclaimed only after), but the bound content can -
+    // before reuse, the raw binding rows captured at encode time (this stage's share of ubo/ssbo/tex/samp/img in S) are compared byte for byte; any difference re-encodes.
+    // ui_patched: the encode used ui_mat_patch's ring copy (the ring wraps and rewrites) - cross-pass reuse forbidden.
+    // m3_res/m3_n: the useResource declarations to replay on a new encoder under the older API.
+    int ab_ui_patched, ab_m3_n; uint64_t ab_sub_seen;
+    uint8_t ab_row_ubo[16 * 24], ab_row_ssbo[16 * 24], ab_row_tex[128 * 8], ab_row_samp[128 * 8], ab_row_img[32 * 8];
+    id ab_m3_res[24]; uint32_t ab_m3_u[24];
+    int8_t zf_state, zf_nf; zskip_fact zf;   // 全零跳过事实表的查表结果缓存（0 未查 / 1 无 / 2 有）；键不变，表长（单测可增补）没变就不重查   // ab_pass：编这块参数的渲染通道序号——同提交内跨通道复用，块字节提交前不变（arena 提交后才回收） | Cached lookup result in the all-zero skip fact table (0 not looked up / 1 absent / 2 present); with the key unchanged and the table length (unit tests may append) unchanged, no re-lookup   // ab_pass: render pass index where this argument block was encoded; reused across passes within one submission - the block's bytes cannot change before the submission commits (arenas are reclaimed only after it)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; } @end   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
 #include "nvn_pso_skey.h"
@@ -2959,15 +2971,17 @@ static void pso_record_render(const pso_key *k, NvShader *vs, NvShader *fs, int 
     g_bp_pso_learn_n++;
     g_bp_pso_learn_ns += bp_now() - lbt;
 }
-// ---- 并行预编：首次遇到的管线原先在提交线程一条条同步编，一帧里连着缺 9 条 = 284 ms（真机重场面）。
-// 现在：一次提交里第一次缺管线时，顺着余下的命令往前扫一遍（只重放状态，不画），把后面还会缺的普通通道管线一并丢给后台并行编；
-// 提交线程走到那次绘制时只等「还没编完的剩余时间」。编出来的管线与同步编的完全相同（同一份描述符）。合并通道 / 特化片元的管线键依赖回放时的规划结果，不预测，照旧同步编。
-// ---- Parallel precompile: pipelines met for the first time used to be compiled synchronously one by one on the submit thread; 9 misses in a row in one frame = 284 ms (heavy scene on a real device).
-// Now: on the first pipeline miss in a submission, scan ahead once along the remaining commands (replaying state only, no drawing) and kick all the normal-pass pipelines that will also miss later to the background to compile in parallel;
-// when the submit thread reaches that draw it only waits for 'the remaining time not yet compiled'. The compiled pipelines are identical to synchronously compiled ones (same descriptor). Pipeline keys of merged passes / specialized fragments depend on the planning result at replay time, are not predicted, and are compiled synchronously as before.
+// ---- 并行预编：首次缺管线时只重放余下状态，收集普通通道的精确键（合并 / 特化通道仍在回放时编译）。
+// 最多两条后台编译；当前绘制缺管线时暂停领取新任务，未开工的同键任务由提交线程接管。
+// 已开工的同键任务仍等真实编译完成；所有结果走同一描述符、缓存与学习路径，不省略绘制。
+// ---- Parallel precompile: on the first miss, replay remaining state to collect exact normal-pass keys (merged / specialized passes still compile during replay).
+// At most two background compiles run. A demanded miss pauses new claims and takes ownership of an unstarted same-key job.
+// A same-key job already running is still awaited; all results use the same descriptors, cache and learning path without omitting draws.
 #define PSO_PEND_MAX 384
-static struct { pso_key k; id<MTLRenderPipelineState> ps; int used, done; } g_pp[PSO_PEND_MAX];
+#define PSO_PEND_WORKERS 2
+static struct { pso_key k; MTLRenderPipelineDescriptor *desc; id<MTLRenderPipelineState> ps; uint64_t order; int used, running, done; } g_pp[PSO_PEND_MAX];
 static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
+static int g_pp_workers, g_pp_paused; static uint64_t g_pp_order;
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
 static void pso_predict_rest(const pso_key *current);
 static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
@@ -2975,29 +2989,69 @@ static dispatch_queue_t pso_pend_queue(void) {
     static dispatch_queue_t q;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INTERACTIVE, 0);
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0);
         q = dispatch_queue_create("dm.nvn.pso-pend", attr);
     });
     return q;
 }
-static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // 提交线程调：没在缓存、没在表里才丢 | Called by the submit thread: kick only if it is neither in the cache nor in the table
+static void pso_pend_worker(void) {
+    for (;;) { @autoreleasepool {
+        pthread_mutex_lock(&g_pp_mu);
+        int at = -1;
+        if (!g_pp_paused) for (int i = 0; i < PSO_PEND_MAX; i++) {
+            if (g_pp[i].used && !g_pp[i].running && !g_pp[i].done && (at < 0 || g_pp[i].order < g_pp[at].order)) at = i;
+        }
+        if (at < 0) { g_pp_workers--; pthread_mutex_unlock(&g_pp_mu); return; }
+        // 在锁内领取；提交线程只能接管尚未领取的任务，槽在编译结束前不复用。
+        // Claim under the lock; demand can take only unclaimed jobs, and a running slot cannot be reused.
+        g_pp[at].running = 1;
+        MTLRenderPipelineDescriptor *d = g_pp[at].desc; g_pp[at].desc = nil;
+        pthread_mutex_unlock(&g_pp_mu);
+        NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        pthread_mutex_lock(&g_pp_mu);
+        g_pp[at].ps = ps; g_pp[at].running = 0; g_pp[at].done = 1;
+        pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
+    } }
+}
+static void pso_pend_start_locked(void) {
+    if (g_pp_paused) return;
+    int queued = 0;
+    for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !g_pp[i].running && !g_pp[i].done) queued++;
+    while (queued-- > 0 && g_pp_workers < PSO_PEND_WORKERS) {
+        g_pp_workers++;
+        dispatch_async(pso_pend_queue(), ^{ pso_pend_worker(); });
+    }
+}
+static void pso_pend_pause(void) {
+    pthread_mutex_lock(&g_pp_mu); g_pp_paused = 1; pthread_mutex_unlock(&g_pp_mu);
+}
+static void pso_pend_resume(void) {
+    pthread_mutex_lock(&g_pp_mu); g_pp_paused = 0; pso_pend_start_locked(); pthread_mutex_unlock(&g_pp_mu);
+}
+static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // 提交线程调：没在缓存、没在表里才排队 | Called by the submit thread: queue only if neither cached nor pending
     if (hm_get_id(&g_pso, k)) return;
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k), slot = -1;
     if (at < 0) for (int i = 0; i < PSO_PEND_MAX; i++) if (!g_pp[i].used) { slot = i; break; }
-    if (at < 0 && slot >= 0) { g_pp[slot].k = *k; g_pp[slot].ps = nil; g_pp[slot].done = 0; g_pp[slot].used = 1; }
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
-    dispatch_async(pso_pend_queue(), ^{
-        NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
-        pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
-    });
+    // 只有提交线程分配槽；构造描述符期间不阻塞已开工任务发布结果。
+    // Only the submit thread allocates slots; descriptor construction must not block running jobs from publishing.
+    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0);
+    pthread_mutex_lock(&g_pp_mu);
+    g_pp[slot].k = *k; g_pp[slot].desc = d; g_pp[slot].ps = nil;
+    g_pp[slot].order = ++g_pp_order; g_pp[slot].running = g_pp[slot].done = 0; g_pp[slot].used = 1; g_pp_kicked++;
+    pso_pend_start_locked();
+    pthread_mutex_unlock(&g_pp_mu);
 }
-static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交线程调：表里有就等它编完并取走；没有返回 nil | Called by the submit thread: if it is in the table, wait for it to finish compiling and take it; otherwise return nil
+static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k, MTLRenderPipelineDescriptor **demand) {
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k); id<MTLRenderPipelineState> ps = nil;
-    if (at >= 0) { while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu); ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; g_pp[at].done = 0; }
+    if (at >= 0) {
+        if (!g_pp[at].done && !g_pp[at].running) { *demand = g_pp[at].desc; g_pp[at].desc = nil; }
+        else { while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu); ps = g_pp[at].ps; g_pp[at].ps = nil; }
+        g_pp[at].used = g_pp[at].done = 0;
+    }
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
@@ -3047,7 +3101,9 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     id<MTLRenderPipelineState> ps;
     NSError *e = nil; uint64_t bt = bp_now();
     uint64_t comp_bt = 0, comp_ns = 0, wait_ns = 0;
-    ps = g_pso_lmap ? nil : pso_pend_take(&k);
+    pso_pend_pause();
+    MTLRenderPipelineDescriptor *demand = nil;
+    ps = g_pso_lmap ? nil : pso_pend_take(&k, &demand);
     if (ps) {
         g_pp_taken++;
         wait_ns = bp_now() - bt;
@@ -3060,9 +3116,9 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
             // 预测解析后续程序时可能领取刚发布的预热管线；同步编译前重新查缓存。
             // Resolving future programs can claim a newly published warm pipeline; recheck before compiling.
             cached = hm_get_id(&g_pso, &k);
-            if (cached) return cached;
+            if (cached) { pso_pend_resume(); return cached; }
         }
-        MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, g_pso_fsfn, g_pso_lmap != NULL);
+        MTLRenderPipelineDescriptor *d = demand ? demand : pso_desc(&k, vs, fs, g_pso_fsfn, g_pso_lmap != NULL);
         comp_bt = bp_now();
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
         comp_ns = bp_now() - comp_bt;
@@ -3070,9 +3126,10 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
         g_bp_pso_compile_ns += comp_ns;
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
-    if (!ps) { MLOG("【红】建渲染管线失败：%s", e.localizedDescription.UTF8String); return nil; }
+    if (!ps) { pso_pend_resume(); MLOG("【红】建渲染管线失败：%s", e.localizedDescription.UTF8String); return nil; }
     pso_record_render(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL);
     hm_put_id(&g_pso, &k, ps);
+    pso_pend_resume();
     return ps;
 }
 static NSString *warm_key(const char *s, size_t n) {
@@ -3317,21 +3374,35 @@ static inline int m3_use_seen(void *p, uint32_t u) {
 #endif
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
-    uint64_t slots[NVN_REFL_MAXB] = {0};
+    uint64_t slots[NVN_REFL_MAXB] = {0}; int ui_patched = 0;
     args_sync_dirty();
     if (sh->ab_token != g_args_token[nvn_stage]) g_args_dirty[nvn_stage] = 1;
-    if (!passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
+    if (!passdump() && !g_args_dirty[nvn_stage] && sh->ab_valid && sh->ab_sub == g_sub_serial && !sh->ab_ui_patched && nvn_stage != 5 &&
+        !memcmp(sh->ab_row_ubo, S.ubo[nvn_stage], sizeof sh->ab_row_ubo) &&
+        !memcmp(sh->ab_row_ssbo, S.ssbo[nvn_stage], sizeof sh->ab_row_ssbo) &&
+        !memcmp(sh->ab_row_tex, S.tex[nvn_stage], sizeof sh->ab_row_tex) &&
+        !memcmp(sh->ab_row_samp, S.samp[nvn_stage], sizeof sh->ab_row_samp) &&
+        !memcmp(sh->ab_row_img, S.img[nvn_stage], sizeof sh->ab_row_img)) {
+        #if DM_NVN_M3
+        // 老接口：跨通道复用时新编码器不知道参数块间接引用的资源，按编码时记下的表重放声明；同一编码器内重复声明幂等，不会错
+        // Older API: on cross-pass reuse the new encoder does not know the resources the argument block references indirectly; replay the declarations recorded at encode time. Repeated declarations within one encoder are idempotent, so this cannot go wrong
+        for (int i = 0; i < sh->ab_m3_n; i++)
+            [(id<MTLRenderCommandEncoder>)en useResource:sh->ab_m3_res[i] usage:(MTLResourceUsage)sh->ab_m3_u[i] stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        g_stat_args_m3_replay += (uint64_t)sh->ab_m3_n;
+        #endif
         bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
         g_stat_args_reuse++;
         return 1;
     }
+    sh->ab_m3_n = 0;   // 确定要新编才重建声明表：放在复用门槛之后，否则复用时会把要重放的表清空 | rebuild the declaration table only when a new encode is certain - after the reuse gate, otherwise reuse would find the table it must replay already cleared
 #if DM_NVN_M3
     // 老接口：着色器经参数块间接访问的每个资源都要在本编码器上声明用途，系统才知道它和别的编码器（上传拷贝、别的通道）之间的先后依赖；
     // 不声明的话只读贴图会和写它的拷贝乱序（迁 Metal 4 前实测过）。同一编码器内重复声明是幂等的
     // Older API: every resource a shader accesses indirectly through an argument block must have its usage declared on this encoder, so that the system knows its ordering dependency against other encoders (upload copies, other passes);
     // without the declaration a read-only texture gets out of order with the copy that writes it (measured before the move to Metal 4). Repeated declarations within one encoder are idempotent
-    #define USE(r, u) do { id<MTLResource> r_ = (id<MTLResource>)(r); if (r_) { if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en useResource:r_ usage:(u)]; else if (!m3_use_seen((__bridge void *)r_, (uint32_t)(u))) [(id<MTLRenderCommandEncoder>)en useResource:r_ usage:(u) stages:MTLRenderStageVertex | MTLRenderStageFragment]; } \
-        if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
+    #define USE(r, u) do { id<MTLResource> r_ = (id<MTLResource>)(r); if (r_) { if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en useResource:r_ usage:(u)]; else if (!m3_use_seen((__bridge void *)r_, (uint32_t)(u))) [(id<MTLRenderCommandEncoder>)en useResource:r_ usage:(u) stages:MTLRenderStageVertex | MTLRenderStageFragment]; \
+        if (sh->ab_m3_n < 24) { int dup_ = 0; for (int k = 0; k < sh->ab_m3_n; k++) if (sh->ab_m3_res[k] == r_ && (sh->ab_m3_u[k] & (uint32_t)(u)) == (uint32_t)(u)) { dup_ = 1; break; } if (!dup_) { sh->ab_m3_res[sh->ab_m3_n] = r_; sh->ab_m3_u[sh->ab_m3_n] = (uint32_t)(u); sh->ab_m3_n++; } } } \
+        if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)   // 记进本块的声明表（跨通道复用时重放；表满照常声明、只是不再跨通道复用该块——超限标志见下） | also record into this block's declaration table (replayed on cross-pass reuse; a full table still declares, the block just stops being reusable across passes - see the overflow flag below)
     #define USE_SAMP(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)   // 采样器不是资源，不用声明 | samplers are not resources and need no declaration
 #else
     #define USE(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
@@ -3351,7 +3422,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
             use_rec("buf", u->addr, u->size, 0, NULL);
-            if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
+            if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) { gpu = pg; ui_patched = 1; } }
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
                    (unsigned long long)(u->addr - mo), (unsigned long long)mo, ((float *)u->addr)[0], ((float *)u->addr)[1], ((float *)u->addr)[2], ((float *)u->addr)[3]);
@@ -3478,7 +3549,10 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     id<MTLBuffer> ab; size_t off = arena_alloc(arg_len, &ab);
     memcpy((uint8_t *)ab.contents + off, slots, arg_len);
     bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
-    sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_token = ++g_args_token[nvn_stage]; g_args_dirty[nvn_stage] = 0;
+    sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_sub = g_sub_serial; sh->ab_token = ++g_args_token[nvn_stage]; sh->ab_valid = 1; g_args_dirty[nvn_stage] = 0;
+    if (ui_patched) sh->ab_m3_n = 0;
+    memcpy(sh->ab_row_ubo, S.ubo[nvn_stage], sizeof sh->ab_row_ubo); memcpy(sh->ab_row_ssbo, S.ssbo[nvn_stage], sizeof sh->ab_row_ssbo);
+    memcpy(sh->ab_row_tex, S.tex[nvn_stage], sizeof sh->ab_row_tex); memcpy(sh->ab_row_samp, S.samp[nvn_stage], sizeof sh->ab_row_samp); memcpy(sh->ab_row_img, S.img[nvn_stage], sizeof sh->ab_row_img);
     g_stat_args_enc++;
     return 1;
 }
@@ -3745,9 +3819,9 @@ static int state_op(uint32_t op, const void *a) {
 static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl);
 
 // 并行预编的预测（见 pso_get 前的说明）：从当前操作之后扫到本次提交结束，只重放状态；遇到绘制就按「那时的状态 + 那个通道的附件格式」算管线键，没建过的丢后台。
-// 通道实际挂不挂深度 / 模板要到回放时才定（纯深度 / 纯模板 / 都不挂的省略），所以每种可能的挂法各算一条键——猜多了只是后台白编，不影响结果。
-// Prediction for parallel precompilation (see the note before pso_get): scan from after the current operation to the end of this submit, replaying only state; at a draw, compute the pipeline key from "the state at that time + that render pass's attachment formats" and dispatch those not yet built to the background.
-// Whether a render pass actually attaches depth / stencil is only decided at replay (depth-only / stencil-only / neither attached are omitted), so one key is computed for each possible attach mode -- guessing too many only means wasted background compiles and does not affect the result.
+// 通道实际挂不挂深度 / 模板由回放规划决定；保留全部挂法。只重放状态无法证明后续绘制不会切开 / 重开当前通道。
+// Prediction for parallel precompilation (see the note before pso_get): scan from after the current operation to the end of this submit, replaying only state; at a draw, compute the pipeline key from "the state at that time + that render pass's attachment formats" and queue those not yet built.
+// Keep every depth / stencil attach mode: replay planning can split or reopen even the current pass, which state-only prediction cannot rule out.
 static void pso_predict_rest(const pso_key *current) {
     if (!g_exec_next) return;
     static typeof(S) Ssave; memcpy(&Ssave, &S, sizeof S);
@@ -3755,8 +3829,8 @@ static void pso_predict_rest(const pso_key *current) {
     int pso_dirty = g_pso_dirty, dss_dirty = g_dss_dirty;
     uint32_t cf[8]; memcpy(cf, g_pass.cfmt, sizeof cf); uint32_t df = g_pass.dfmt, sf = g_pass.sfmt, samples = g_pass.samples, dfull = df, sfull = sf; int kicked0 = (int)g_pp_kicked, draws = 0;
     fz_cursor cur = {.p = g_exec_next};
-    // 先收齐再丢：按「附件原样挂」的键排在前（最可能用到），其余挂法排在后——后台并发有限，先丢的先编完
-    // Collect them all first, then dispatch: keys for "attachments attached as-is" go first (most likely to be used), the other attach modes after -- background concurrency is limited, and what is dispatched first is compiled first
+    // 先收齐再排队：原样附件键先于其余挂法，后台按入队序领取；当前缺失键发布后才恢复领取。
+    // Collect before queueing: as-is attachment keys precede alternatives; workers claim FIFO only after the demanded key is published.
     enum { QN = 160 }; static struct { pso_key k; void *vs, *fs; } qa[QN], qb[QN]; int na = 0, nb = 0;
     for (int guard = 0; guard < 200000 && na < QN; guard++) {
         const uint8_t *q; op_hdr hq; const void *aq;
