@@ -180,11 +180,12 @@ static void test_scale3d(void) {
     s3_hold_pass(); CHECK(s3_n(240, F60) == 2, "继续升到 2 档");
     s3_hold_pass(); CHECK(s3_n(240, F60) == 1, "继续升到 1 档");
     s3_hold_pass(); CHECK(s3_n(240, F60) == 0, "升回配置值 0 档");
-    // 持续 CPU 慢帧，旧历史仍请求降档：GPU 有余量必须能回升，不能被提前 return 卡住。
-    // Persistent CPU stalls with stale drop history must not block a GPU-headroom recovery.
+    // 持续 CPU 慢帧：掉帧活跃期即使 GPU 有余量也绝不升档，必须等掉帧停止（连续干净窗）才升档。
+    // Active dropped frames: must never upscale even with GPU headroom until frame drops stop.
     s3 = (scale3d_ctl){.max_level = 4, .level = 3, .gpu_ms = 9.0, .nw = 5}; s3_now = 10800 * S3_SEC;
     for (int i = 0; i < 5; i++) { s3.wn[i] = 60; s3.wd[i] = 60; }
-    CHECK(s3_n(120, D60) == 2, "持续慢帧 + 降档历史 + GPU 有余量：4 秒后仍能升档");
+    CHECK(s3_n(120, D60) == 3, "持续掉帧时即便 GPU 有余量也绝不升档（防振荡与重切 G-buffer）");
+    CHECK(s3_n(240, F60) == 2, "掉帧停止且 GPU 有余量：连续 2 窗干净后升档");
     // 升档失败后回落的低分辨率 GPU 虽有余量，也不能绕过 90 秒防抖。
     // A failed upscale must keep its retry delay even if the lower scale has GPU headroom.
     s3 = (scale3d_ctl){.max_level = 4, .level = 1, .gpu_ms = 20.0, .last_up = s3_now};

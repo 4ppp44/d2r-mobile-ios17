@@ -92,6 +92,8 @@ uint64_t dm_prof_ribbon_ns(void);   // 第一次出现 OpenPanel MainMenuButtonR
 void *objmap_get(const void *guest); void objmap_put(const void *guest, void *host); void *objmap_del(const void *guest);
 void hle_signal_system_event(void *g);   // hle_thread.c：触发服务层 SystemEvent（任何线程） | hle_thread.c: signal a service-layer SystemEvent (any thread)
 void hle_bind_system_event(void *g, int autoclear);   // 客体线程上把客体 SystemEvent 绑到内核事件 | On a guest thread, bind a guest SystemEvent to a kernel event
+uint64_t hle_system_event_binding(void *g);   // 绑定的不透明生命周期 ID，未绑定为 0；重绑定即使复用地址和句柄也获得新 ID | Opaque lifetime ID of a binding, 0 if unbound; a rebind gets a new ID even if its address and handle are reused
+int hle_signal_system_event_binding(uint64_t binding);   // 仅向该绑定生命周期发信号（任何线程）；写端句柄关闭后返回 0 | Signal only this binding lifetime (any thread); 0 after its write handle closes
 // 缺页钩子 / 宿主写客体内存前钩子（crash.c；写保护脏页跟踪用）
 // Page fault hook / hook before the host writes guest memory (crash.c; used for write-protect dirty page tracking)
 void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc));

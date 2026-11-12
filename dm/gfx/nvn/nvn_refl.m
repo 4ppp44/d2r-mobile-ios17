@@ -65,6 +65,16 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
                 }
             }
         }
+        // Legacy non-fragment metadata scanned only fp_cN, so an absent bank entry
+        // does not prove it unread. Keep known offsets intact; the encoder already
+        // fills the whole bank when drv_read is set. Stage lives in JSON, not nvn_refl.
+        NSString *stage = j[@"stage"];
+        if ([@[@"vs", @"cs", @"hs", @"ds", @"gs"] containsObject:stage ?: @""]) {
+            for (int i = 0; i < o->nb; i++) {
+                int bank = o->b[i].kind == NVN_RB_DRV0 ? 0 : o->b[i].kind == NVN_RB_DRV2 ? 2 : -1;
+                if (bank >= 0 && !o->drv_read[bank]) o->drv_read[bank] = 1;
+            }
+        }
         NSArray *uf = j[@"drv_unfillable"];
         if ([uf isKindOfClass:[NSArray class]] && uf.count) FAIL("运行时读驱动段的回放层填不了的位置：%s", [[uf componentsJoinedByString:@" "] UTF8String]);
         NSString *c1 = j[@"c1"];

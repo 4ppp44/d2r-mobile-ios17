@@ -1,164 +1,63 @@
-# D2R Mobile: Experimental iOS 17 / A16 Metal Compatibility Layer
+# D2R Mobile: experimental iOS17 / A16 host
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-iOS%2017.0%2B%20%7C%20Apple%20A16%20Bionic-orange.svg)](docs/IOS17.md)
+[简体中文](README.zh-CN.md) · [Complete changelog](CHANGELOG.md) · [1202 runtime review](docs/PERFORMANCE_1202.md) · [iOS17 build notes](docs/IOS17.md) · [Upstream README](README.upstream.md)
 
-Unofficial compatibility layer and native host runtime for [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile), specifically adapted and optimized for **Apple A16 Bionic (iPhone 14 Pro / 14 Pro Max / 15 / 15 Plus)** running **iOS 17.0+**.
+Unofficial Darwin host and NVN-to-Metal3 adaptation of [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile). Source synchronized through local integration **1.0.19 /2026111202** on 2026-11-13. A build label identifies a local test baseline; it is not a promise of a downloadable playable IPA.
 
-[中文文档 (README.zh-CN.md)](README.zh-CN.md) | [Changelog](CHANGELOG.md) | [iOS 17 Details](docs/IOS17.md) | [Dependencies](docs/DEPENDENCIES.md) | [Upstream README](README.upstream.md)
+## Current status
 
----
+**Cold-pipeline stutter remains.** A six-minute iPhone15,3/iOS17.0 report mostly samples near60fps at3D scale0.75, but region43/frame4222 takes608.8ms:582.7ms pipeline preparation, including3 new compiles/504.4ms. Read the [full review](docs/PERFORMANCE_1202.md) before interpreting average FPS.
 
-## ❓ Can you build a playable game solely from the files in this repository?
+1202 overlaps demanded-PSO construction with prediction decoding when speculative workers are idle and prioritizes primary attachment candidates. Several measured joins still consume almost the full compile duration. Earlier region42/703ms CPU spikes were not covered; region40/~219ms non-compile stalls were not reproduced and are not declared fixed. Buffer-copy prewarm is **not included**: warm-process feasibility checks are not a cold-start benefit test. QoS expresses scheduling intent, not guaranteed P-core affinity.
 
-> **Direct Answer:** **NO.** You cannot produce a runnable game IPA solely from the files in this repository.
+## Included source
 
-### Why? (Architecture & Legal Boundaries)
+Darwin threads/synchronization, VFS/memory/audio, iOS touch controls, Metal3 translation, shader reflection and argument caching, PSO learning/prediction, dynamic resolution, generation tools and tests. MIT licensing and attribution are retained; see [LICENSE](LICENSE) and[CONTRIBUTING](CONTRIBUTING.md).
 
-1. **What THIS repository provides (Open Source Host Runtime & Translators)**:
-   - **Host Runtime System**: Darwin/iOS native POSIX environment translation (Threads, System Calls, VFS, Memory Management, Input/HID).
-   - **NVN-to-Metal 3 Translation Layer**: Full NVN graphics implementation (`hle_nvn.c`, `nvn_mtl.m`), shader reflection (`nvn_refl.m`), argument buffer caching, and speculative pipeline state compilation.
-   - **Dynamic Resolution Scaling (DRS)**: Real-time GPU timestamp-gated dynamic 3D scale controller.
-   - **Custom Mobile Touch HUD**: Native touchscreen controls with virtual thumbsticks, skill buttons, map/cube overlays, and haptic feedback.
-   - **Automated Verification Test Suites**: Unit and integration test suites running on macOS Apple Silicon.
+The repository excludes guest executables, RomFS, keys, saves, compiled shader libraries, IPAs and original device logs. Game-derived HUD tables and artwork are generated locally, not committed. Pipeline/hash metadata is not a shader payload. The source alone does not assemble a playable game.
 
-2. **What this repository DOES NOT provide (Proprietary Game Assets & Guest Binaries)**:
-   - **Copyrighted Game Assets (~15+ GB)**: Models, textures, audio, level data, and strings belonging to Blizzard (`RomFS` data files `00-00000000.data` ~ `00-00000011.data`).
-   - **Switch Encryption Keys**: Nintendo Switch console keys (`prod.keys` / `title.keys`).
-   - **Guest Game Binaries**: Original Switch ARM64 binaries (`main`, `subsdk*` from the Switch ExeFS).
+## Build prerequisites and private inputs
 
-### When CAN you build a playable game?
-If you legally own the Nintendo Switch version of Diablo II: Resurrected and dump your own `prod.keys`, ExeFS, and RomFS assets from your console, **you can achieve a complete, closed-loop build of the game IPA** using the scripts and toolchains in this repository.
+Use an Apple Silicon Mac, full Xcode/CLI tools, xcodegen and the upstream Python/translation dependencies. Follow[game-file requirements](docs/GAME_FILES.md),[dependencies](docs/DEPENDENCIES.md), and[upstream setup](README.upstream.md) with your own matching game files and3.3.94012/r44-touch outputs outside Git. Do not relabel old rewrites or shader chains.
 
----
-
-## 🚀 How to Use & How to Build (Complete Guide)
-
-### 1. Prerequisites
-
-- **Host Machine**: Mac with Apple Silicon (M1/M2/M3/M4), macOS 14.0+ recommended.
-- **Xcode & Command Line Tools**: Installed via `xcode-select --install` or Xcode 15/16.
-- **Python**: Python 3.10+ with standard modules.
-- **Target Device**: iPhone 14 Pro, iPhone 14 Pro Max, iPhone 15, or iPhone 15 Plus (Apple A16 Bionic recommended). System: **iOS 17.0+**.
-- **Installation Tool**: **TrollStore** installed on iOS 17.0 (required for JIT and increased memory limits without jailbreak).
-
----
-
-### 2. Preparing Game Assets
-
-1. **Dump Keys**: Place your Nintendo Switch `prod.keys` in `~/.switch/prod.keys` or specify its path during extraction.
-2. **Dump Game Package**: Obtain your legally owned D2R Switch package (`.xci` or `.nsp` with updates).
-3. **Extract ExeFS and RomFS**:
-   Using `hactool` or `hactoolnet`:
-   - Extract the `ExeFS` partition to obtain the game binaries (`main`, `subsdk0`, `subsdk1`, etc.).
-   - Extract the `RomFS` partition to obtain the game data files (`data/00-00000000.data` through `00-00000011.data`).
-4. **Organize Asset Directory**:
-   Place the extracted RomFS data files into:
-   ```text
-   releases/resources/D2R Mobile Resources/data/
-   ```
-   *(To keep the installed IPA small ~146 MB, game resources are maintained separately and copied to the app's documents folder on the phone).*
-
----
-
-### 3. Building the IPA
-
-#### Option A: Full Build from Extracted Switch Inputs
-Run the build script with a unique build identifier (`YYYYMMDDNN`):
-```bash
-./scripts/build_game.sh 2026102601
-```
-The script will:
-1. Apply binary rewriting and translation hooks to the guest ARM64 NSO binaries via `dm/tools/patch_nso.py`.
-2. Compile the Metal 3 translation layer and native iOS host app (`DmIOS`).
-3. Package the native application shell, codesign ad-hoc, and output the final IPA to `releases/D2R-iOS17-v1.0.18-build2026102601.ipa`.
-
-#### Option B: Rebuilding Host from a Retained Private IPA
-If you already possess a previously verified private build and wish to update only the Metal translation layer and host runtime:
-```bash
-D2R_RETAINED_INPUT="releases/D2R-iOS17-v1.0.18-build2026102410.ipa" ./scripts/build_game.sh 2026102601
-```
-The script will extract and preserve the byte-identical guest game module from the retained IPA while cleanly recompiling and linking the latest host runtime.
-
----
-
-### 4. Installation & Playing on iOS Device
-
-1. **Install IPA via TrollStore**:
-   - Transfer the generated `.ipa` to your iPhone (via AirDrop, iCloud Drive, or local server).
-   - Open the IPA in **TrollStore** and tap **Install**.
-   - *Why TrollStore?* It automatically applies `com.apple.developer.kernel.extended-virtual-addressing` and `com.apple.developer.kernel.increased-memory-limit` entitlements required by the 64-bit translation runtime.
-2. **Place Game Data on the Phone**:
-   - Open the **Files (文件)** app on iOS.
-   - Navigate to: `On My iPhone (我的 iPhone) -> D2R Mobile -> data/`.
-   - Copy the 18 RomFS data files (`00-00000000.data` ... `00-00000011.data`) into this `data/` folder.
-   - Alternatively, place pre-packed ASTC texture packs in the game resources folder for faster texture loading and reduced memory footprint.
-3. **Launch the Game**:
-   - Tap the game icon on your home screen.
-   - First launch will index shader libraries and load the camp scene.
-
----
-
-### 5. Controls & In-Game Configuration
-
-#### Mobile Touch HUD Layout
-- **Left Thumb Area**: Floating virtual analog stick for character movement.
-- **Right Thumb Area**: Primary attack and skill buttons (supports touch-and-drag directional aiming).
-- **HUD Overlays**:
-  - Potion pouch quick-drink slots along the bottom.
-  - Interactive minimap toggle in the upper right.
-  - Inventory, character stats, and skill tree tabs along the top bar.
-
-#### Diagnostics & Tuning Switches (`Documents/` Folder)
-Place plain text files in the app's `Documents/` directory (accessible via the iOS Files app):
-
-| File | Default | Purpose / Effect |
-| :--- | :--- | :--- |
-| `dm_sample.txt` | `10` | CPU backtrace sampler interval in ms. Set `0` or `off` to disable background sampling for cleanest performance. |
-| `log_sync_profile.txt` | Batched | Set to `baseline` for synchronous per-line logging; default uses a lock-free ring buffer. |
-| `diagnostics_profile.txt` | Disabled | Diagnostic profiling mode (`gpu`, `timing`, `display`). Must be accompanied by matching `diagnostics_build.txt`. |
-
----
-
-## ⚡ Current Baseline: 1.0.18 (Build 2026102501)
-
-Key architectural advancements in the current release:
-
-- **GPU-Gated Dynamic Resolution Scaling (DRS)**:
-  - Replaced legacy heuristic downscaling with a real per-frame Metal GPU timestamp feedback loop (`nvn_gpu_recent_mean()`).
-  - The controller now downscales only when the 60-frame rolling GPU mean reaches $\ge 75\%$ of the 16.67 ms frame budget.
-  - Recovers image resolution within 4 seconds when GPU headroom exists, while preventing false downscaling caused by temporary CPU stalls.
-  - Default 3D scale floor raised to **0.60** to maintain crisp image quality.
-- **Speculative Pipeline Compilation Throttling**:
-  - Background speculative PSO worker threads capped at 2.
-  - Speculative workers immediately pause and yield when the main rendering thread encounters a synchronous pipeline compile request, eliminating 180 ms+ presentation stalls.
-- **Cross-Pass Argument Block Reuse**:
-  - Reuses Metal 3 resource argument blocks across multiple render passes within the same command buffer submission, eliminating redundant GPU encoder declarations.
-- **Lock-Free Pool Address Lookup**:
-  - Seqlock generation protocol (`pool_snap_publish` / `pool_snap_find`) enables thread-safe, lock-free memory pool translation.
-
----
-
-## 🧪 Verification & Unit Testing
-
-You can run the full suite of host and graphics unit tests directly on any Apple Silicon Mac without an iOS device or private game files:
-
-```bash
-# 1. Run Host OE & DRS Dynamic Scaling Tests (68/68 passed)
-cd dm/host/tests && make build/t_oe && build/t_oe
-
-# 2. Run NVN to Metal Graphics State & Memory Tests (82/82 passed)
-cd dm/gfx/tests && make t_nvn && ./t_nvn
-
-# 3. Run Real-Metal Speculative Pipeline Deduplication Tests (10/10 passed)
-cd dm/gfx/tests && make t_pso_predict_dedup && ./t_pso_predict_dedup
+```sh
+python3 dm/gfx/tools/dmsh_chain.py --check-tools
 ```
 
----
+Generate the complete ASTC legacy-device pack from your own resources; a small texture probe is not a replacement. See [legacy devices](docs/LEGACY_DEVICES.md), then build:
 
-## ⚖️ License & Notice
+```sh
+export DM_ROOT="$HOME/d2r-private-work"
+export DM_OUT="$DM_ROOT/build/cache/dm/out/3.3.94012-r44-touch"
+export DM_ASTC_PACK="$DM_ROOT/build/astc/pack"
+export DM_BUNDLE_ID="your.own.bundle.identifier"
+export DM_BUILD_NUMBER="2026111301" # choose an unused numeric YYYYMMDDNN
+bash dm/ios/build_ios17.sh
+```
 
-- Source code is licensed under the [MIT License](LICENSE).
-- Diablo II: Resurrected is a registered trademark of Blizzard Entertainment, Inc.
-- Nintendo Switch is a registered trademark of Nintendo Co., Ltd.
-- This project is an independent open-source research and compatibility initiative; it is neither affiliated with, authorized, nor endorsed by Blizzard Entertainment or Nintendo.
+`build_ios17.sh` generates private tables/assets/project and compiles an unsigned arm64 iPhone host targeting17.0. It does not sign, export an IPA, install or launch. `DM_ROMFS_SRC` may select your own update RomFS; default layout and toolchain regeneration are described in[IOS17](docs/IOS17.md). PNG icons need no simulator download; optional catalog mode requires an SDK-matched runtime.
+
+A complete clean extraction/rebuild is not claimed for this source sync. Private-workspace `scripts/build_game.sh`/retained-package tools are not shipped here. Existing preview ZIPs remain tied to their original tags, not1202; do not mix older shells with the current host/chain.
+
+## Installation and resource management
+
+Use a signing/install method appropriate to your device and entitlements. The private iOS17.0 tests require the relevant memory/JIT capabilities; alternate signing, other OS versions, App Store or TestFlight behavior is not certified. Changing a bundle identifier creates another data container; it does not migrate saves. Preserve older working packages, saves and resources instead of uninstalling to update.
+
+Keep multi-GB game resources separate from the IPA and import them through the application's validation flow. The[no-Xcode route](docs/NO_XCODE.md) uses its own matched source/build inputs and still needs your own game data.
+
+## Power, quality and diagnostics
+
+The power-saving switch changes actual30/60fps production cadence. DRS and quality settings affect scale; compare identical scenes, modes and cache state. Worker-QoS experiments do not bind cores. The `normal` measurement profile disables extra instrumentation, **not all logging**. Startup/performance diagnostics remain active; deleting a log does not stop its producer. Instrumented GPU profiles are not unperturbed performance scores.
+
+## Validation
+
+```sh
+make -C dm/gfx/tests run
+sh dm/ios/tests/run_input_profile.sh
+```
+
+Some reflection/resource tests require local generated shader fixtures; inspect their source/setup instead of claiming an asset-free pass. Real Metal checks use the Mac GPU; mock/contract checks have narrower scope. Before 1202 delivery,20 targeted real Mac Metal modes/184 checks, the full local GFX suite, and an iOS17 retained-input build/signature/ZIP check passed. The later A16 report still found609ms stutter. See [provenance](docs/IOS17_PROVENANCE.md) for public-export validation and its limits.
+
+## Reporting issues and history
+
+Report exact build/commit, model/OS, FPS/quality, region, first/repeated entry, loading visibility and representative frame metrics. Redact personal paths/device identifiers; do not attach keys, game resources, saves or original device logs publicly. The[changelog](CHANGELOG.md) retains earlier versions and corrections; later device findings supersede older claims of complete fixes or core pinning. Upstream documentation is retained in`README*.upstream.md`.

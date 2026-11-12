@@ -12,6 +12,8 @@ void *objmap_del(const void *k) { for (int i = 0; i < 8; i++) if (om[i].k == k) 
 static _Atomic int g_sig;
 void hle_signal_system_event(void *g) { (void)g; atomic_fetch_add_explicit(&g_sig, 1, memory_order_seq_cst); }
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }   // 真实现要客体线程 + SDK 内核事件；单测只数触发次数 | the real implementation needs a guest thread + SDK kernel event; the unit test only counts triggers
+uint64_t hle_system_event_binding(void *g) { (void)g; return 1; }
+int hle_signal_system_event_binding(uint64_t binding) { (void)binding; atomic_fetch_add_explicit(&g_sig, 1, memory_order_seq_cst); return 1; }
 int main(void) {
     {   // 5.1 下混（期望按 Q15 系数手算：0.707·0.707 = 16384/32768 = 0.5，0.707 = 23170/32768）：顺序 左前 右前 中置 低音 左后 右后 | 5.1 downmix (expected values worked out by hand from the Q15 coefficients: 0.707*0.707 = 16384/32768 = 0.5, 0.707 = 23170/32768): order front left, front right, centre, LFE, rear left, rear right
         static const struct { int16_t in[6]; int16_t l, r; const char *what; } c[] = {

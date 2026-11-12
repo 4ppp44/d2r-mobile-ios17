@@ -361,7 +361,7 @@ def drv_reads(src):
     out = {}
     for bank in (0, 2):
         offs, dyn = set(), False
-        for m in re.finditer(r'fp_c%d\)\._m0\[([^\]]+)\]' % bank, src):
+        for m in re.finditer(r'\b[a-z]+_c%d\)\._m0\[([^\]]+)\]' % bank, src):
             idx = m.group(1).rstrip('u')
             if idx.isdigit(): offs.add(int(idx) * 16)
             else: dyn = True

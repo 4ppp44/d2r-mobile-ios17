@@ -16,3 +16,10 @@
 Runtime source is synchronized to the privately retained1.0.17/build2026101705 baseline, with public build/guest-minOS17/PNG-wrapper fixes retained. No full latest-main merge is implied. Generated c1 runtime captures, skill/item/experience tables, Gen trees and private artifacts are excluded. The1706 timeout recheck and rejected MRU2 prototype are not included.
 
 The core NVN source SHA256 is `650d3499c13cf7961cbe78396f34cf036188e2b5d4060c13717f4bfde9a3106b`. The source-only package is not claimed byte-identical to a private IPA: public toolchain/build wrappers, regenerated assets and signing differ. New checks are compile/native contracts, not A16 power or end-to-end latency acceptance. Residual30FPS stutter and heat remain.
+
+
+## 2026-11-13 source sync through2026111202
+
+Exported reviewed host/graphics/touch source and regression tests from the current iOS17 candidate; preserved public-only build helpers and upstream license/docs. Generated host tables/native-art code, binaries, keys, saves, caches and original device logs are excluded. README in English/Chinese and full changelog updated. See [PERFORMANCE_1202](PERFORMANCE_1202.md) for failed device performance findings and test boundaries. Source integrity and exported-checkout GFX validation are recorded with this sync; no fresh full-game generation or new device install is claimed.
+
+Public-export validation: exported71 source/test files match the1202 candidate byte-for-byte; generated/private exclusions verified. Exported-checkout `make -C dm/gfx/tests run` passed using local generated fixtures for reflection/resource checks (fixtures not distributed). `run_input_profile.sh` passed12 actual-Foundation/input-policy checks. Python AST, build-helper syntax, local documentation links and diff whitespace passed. This is source/test verification, not another A16 gameplay run or fresh asset generation.

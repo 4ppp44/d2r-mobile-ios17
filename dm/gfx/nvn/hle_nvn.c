@@ -30,6 +30,7 @@ __attribute__((weak)) void dm_hle_wake_counts(uint64_t *wakes, uint64_t *skips) 
 #include "nvn_adaptive_pace.h"
 #include "../../host/front.h"
 #include "nvn_dirty.h"
+#include "nvn_pipeline_cache.h"
 #include <mach/mach_time.h>
 #include <mach/mach.h>
 #include <TargetConditionals.h>
@@ -54,7 +55,17 @@ __attribute__((weak)) void dm_hle_wake_counts(uint64_t *wakes, uint64_t *skips) 
 typedef struct { _Atomic uint64_t cnt; void *fn; } nvn_slot_t;
 nvn_slot_t nvn_slot[NVN_NFUNC];                 // 跳板按 i*16 访问，布局不可改 | The thunk accesses it by i*16; the layout must not change
 _Static_assert(sizeof(nvn_slot_t) == 16, "跳板按 16 字节步长寻址");
-extern void *nvn_thunk[NVN_NFUNC];
+extern void *nvn_thunk[NVN_NFUNC], *nvn_thunk_fast[NVN_NFUNC];
+static int g_nvn_counting;
+static void nvn_counting_init(void) {
+    const char *e = getenv("DM_NVN_COUNT"), *c = getenv("DM_NVN_TSV_CALLS");
+    g_nvn_counting = (e && atoi(e)) || (getenv("DM_NVN_TSV") && !(c && !atoi(c)));
+}
+static int nvn_counting(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, nvn_counting_init);
+    return g_nvn_counting;
+}
 extern const char *nvn_names[NVN_NFUNC];
 extern void nvn_unimpl_entry(void);
 extern void nvn_prof_entry(void);
@@ -82,7 +93,10 @@ typedef struct { const char *name; void *fn; } nvn_impl;
     static ret h_##name(__VA_ARGS__)
 
 static int g_log;
+#ifndef NVN_NEW_SERIAL_DEFINED
+#define NVN_NEW_SERIAL_DEFINED
 uint64_t nvn_new_serial(void) { static _Atomic uint64_t n; return ++n; }
+#endif
 static unsigned g_nsem;                          // 语义实现个数（nvn_init_slots 填） | Number of semantic implementations (filled by nvn_init_slots)
 #define OLOG(...) do { if (g_log) LOG("[nvn] " __VA_ARGS__); } while (0)
 
@@ -105,7 +119,7 @@ static void nvn_init_slots(void) {
 static void *nvn_lookup(const char *name) {
     nvn_init_slots();
     for (unsigned i = 0; i < NVN_NFUNC; i++)
-        if (!strcmp(nvn_names[i], name)) return nvn_thunk[i];
+        if (!strcmp(nvn_names[i], name)) return nvn_counting() ? nvn_thunk[i] : nvn_thunk_fast[i];
     LOG("【红】NVN 取址未知名字：%s", name ? name : "(null)");
     return NULL;
 }
@@ -500,21 +514,101 @@ static pthread_mutex_t g_cs_mu = PTHREAD_MUTEX_INITIALIZER;
 uint64_t dm_nvn_frame_count(void);
 static int cs_on(void) { if (g_cs.on < 0) g_cs.on = getenv("DM_NVN_CMDSTAT") != NULL; return g_cs.on; }
 static void cs_op(uint32_t op, uint32_t size) { if (!cs_on() || op >= 64) return; pthread_mutex_lock(&g_cs_mu); g_cs.op_n[op]++; g_cs.op_b[op] += size; pthread_mutex_unlock(&g_cs_mu); }
+// ---------- 记录侧同槽合并（last-write-wins）：同槽的相邻状态写在录进命令内存之前就地合并 ----------
+// ---------- Record-side same-slot coalescing (last-write-wins): adjacent state writes to the same slot are merged before they reach command memory ----------
+// 合并条件（三条同时成立，否则不合并）：同一个命令缓冲、同一个槽键、尺寸相同，且该槽的上一条记录与现在之间没有任何屏障记录。
+// 屏障记录 = 不是纯状态写的全部记录：绘制 / 派发 / 拷贝 / 清贴图 / 设目标 / 调用 / 跳转 / 结束 / 信号事件 / 报告与重置计数器 /
+// 设贴图池与采样器池 / Barrier / 换段 / 未知操作码。纯状态写只写自己的槽、回放时不读任何别的槽（见 nvn_mtl.m 的 state_op），
+// 所以两条同槽记录之间夹着别的状态写是安全的。
+// 不变式：合并后，任何屏障记录看到的每个槽的值与逐条回放完全相同；回放层的前向扫描（ds_scan、写回前瞻、PSO 预测、冻结与推迟）
+// 只在屏障点采样状态，所以行为不变。一段同槽记录里第一条留在原处并接收后面的值，后面的记录根本不写：段内至少还留一条，
+// 所以「自上次屏障以来是否出现过状态记录」这类判断（clear_fold_ready 等）答案不变。
+// 合并不改记录的尺寸与位置，只把新值写进旧记录的载荷：命令流的 op / size 骨架不动，回放按 h.size 遍历不受影响。
+// 游戏 CPU 侧读的是自己的状态对象（不在命令内存里），因此不受合并影响。
+// Merge condition (all three must hold, otherwise nothing is merged): the same command buffer, the same slot key, the same size, and no
+// barrier record between that slot's previous record and now.
+// A barrier record is anything that is not a pure state write: draw / dispatch / copy / texture clear / set render target / call / jump / end /
+// signal event / report and reset counter / set texture and sampler pool / barrier / segment rollover / unknown opcode. A pure state write
+// writes only its own slot and reads no other slot when replayed (see state_op in nvn_mtl.m), so another state write in between is harmless.
+// Invariant: after merging, every barrier record sees exactly the value per slot that a one-by-one replay would give it; the replay layer's
+// forward scanners (ds_scan, store lookahead, PSO prediction, freeze and defer) sample state only at barrier points, so their behaviour is
+// unchanged. The first record of a run of same-slot records stays where it is and receives the later values, and the later records are never
+// written at all: the run keeps at least one record, so checks of the form "has any state record been seen since the last barrier"
+// (clear_fold_ready etc.) keep the same answer.
+// A merge never changes a record's size or position; it only writes the new value into the old record's payload, so the op / size skeleton of
+// the command stream is untouched and replay keeps walking it by h.size.
+// The game's CPU side reads its own state objects (which are not in command memory), so merging does not affect it.
+enum { LWW_N = 128 };   // 直接映射表，一次比较判命中；冲突只是放弃这次合并，不影响正确性 | Direct-mapped table, one comparison per lookup; a collision only drops this merge, never correctness
+typedef struct { uint64_t gen; uint32_t key, size; const cmd_t *cb; uint8_t *rec; } lww_slot_t;
+static lww_slot_t g_lww[LWW_N];
+static _Atomic uint64_t g_lww_gen = 1;   // 屏障 / 换段 / 开始录制时自增一次即作废全表（不逐项清） | One increment on a barrier / segment rollover / recording start invalidates the whole table (no per-entry clearing)
+static _Atomic uint64_t g_lww_merged, g_lww_saved;   // 累计合并条数、累计省下的命令字节（含记录头） | Cumulative merged records and command bytes saved (record header included)
+// 纯状态写：与 nvn_mtl.m 的 state_op 处理的操作码一一对应（回放只写自己的槽、不读任何别的槽）；其余操作码一律当屏障。
+// 拷贝行距 / 图像行距也在这一组里（它们同样是纯状态写），只是它们永远紧贴一次拷贝记录，实际不会合并。
+// Pure state writes: exactly the opcodes handled by state_op in nvn_mtl.m (replay writes only their own slot and reads no other slot); every
+// other opcode counts as a barrier. The copy row / image strides belong to this group too (they are pure state writes as well), but they always
+// sit right next to a copy record, so they never actually merge.
+#define LWW_STATE_MASK                                                                                                     \
+    ((1ull << OP_BIND_STATE) | (1ull << OP_BIND_VATTR) | (1ull << OP_BIND_VSTREAM) | (1ull << OP_BIND_VBUF) |               \
+     (1ull << OP_BIND_UBO) | (1ull << OP_BIND_SSBO) | (1ull << OP_BIND_TEX) | (1ull << OP_BIND_SAMP) |                      \
+     (1ull << OP_BIND_IMG) | (1ull << OP_BIND_PROGRAM) | (1ull << OP_SCISSOR) | (1ull << OP_VIEWPORTS) |                    \
+     (1ull << OP_DEPTH_RANGE) | (1ull << OP_POLY_OFFSET) | (1ull << OP_BLEND_COLOR) | (1ull << OP_STENCIL) |                 \
+     (1ull << OP_COPY_STRIDE) | (1ull << OP_COPY_IMAGE_STRIDE))
+// 开关：缺省关闭（DM_NVN_LWW=1 显式开启；Documents/dm_opt=0 强制关闭）。
+// Switch: default OFF (explicitly enabled via DM_NVN_LWW=1; forced OFF by Documents/dm_opt=0).
+static _Atomic int g_lww_mode = -1;
+void dm_nvn_lww_set(int on) { atomic_store_explicit(&g_lww_mode, on, memory_order_relaxed); }
+static int lww_enabled(void) {
+    int m = atomic_load_explicit(&g_lww_mode, memory_order_relaxed);
+    if (m < 0) {
+        const char *e = getenv("DM_NVN_LWW");
+        m = (e && atoi(e) > 0) ? 1 : 0;
+        atomic_store_explicit(&g_lww_mode, m, memory_order_relaxed);
+    }
+    return m && !mtl_opt_off();
+}
+static int lww_state_op(uint32_t op) {
+    return lww_enabled() && op < 64 && (int)((LWW_STATE_MASK >> op) & 1);
+}
+static void lww_barrier(void) { atomic_fetch_add_explicit(&g_lww_gen, 1, memory_order_relaxed); }
+// 槽键：高 8 位操作码 + 三个 8 位子槽字段。字段放不下（负数 / 超 255）返回 0 = 这条不参与合并（OP_END 不是状态写，0 只可能来自这里）
+// Slot key: the opcode in the high 8 bits plus three 8-bit sub-slot fields. A field that does not fit (negative / above 255) returns 0 = this
+// record takes part in no merge (OP_END is not a state write, so 0 can only come from here)
+static uint32_t lww_key(uint32_t op, int a, int b, int c) {
+    if ((unsigned)a > 255u || (unsigned)b > 255u || (unsigned)c > 255u) return 0;
+    return op << 24 | (uint32_t)a << 16 | (uint32_t)b << 8 | (uint32_t)c;
+}
+// 直接映射：键乘常数取高位，再异或命令缓冲指针的高位（多个命令缓冲互不挤占）
+// Direct mapping: multiply the key and take the high bits, then xor in the high bits of the command buffer pointer (several command buffers do not evict each other)
+static unsigned lww_idx(const cmd_t *o, uint32_t key) { return (key * 2654435761u ^ (uint32_t)((uintptr_t)o >> 12)) >> 25 & (LWW_N - 1); }
+uint64_t dm_nvn_lww_stats(uint64_t *merged, uint64_t *saved);
+// 非热路径：读累计合并条数与省下的字节（诊断 / 测试用） | Non-hot path: read the cumulative merged record count and the bytes saved (diagnostics / tests)
+uint64_t dm_nvn_lww_stats(uint64_t *merged, uint64_t *saved) {
+    uint64_t m = atomic_load_explicit(&g_lww_merged, memory_order_relaxed), b = atomic_load_explicit(&g_lww_saved, memory_order_relaxed);
+    if (merged) *merged = m; if (saved) *saved = b; return m;
+}
+static uint64_t g_lww_prev_n, g_lww_prev_b;   // cs_dump 上次打印时的累计值（只给诊断用） | Cumulative values at the previous cs_dump (diagnostics only)
 static void cs_dump(void) {   // 每帧调一次（出图处） | Called once per frame (at present)
     if (!cs_on()) return; uint64_t f = dm_nvn_frame_count(); if (f - g_cs.frame0 < 300) return;
     pthread_mutex_lock(&g_cs_mu); double n = (double)(f - g_cs.frame0); char top[700]; int k = 0; uint8_t used[64] = {0};
     for (int r = 0; r < 8; r++) { int bi = -1; for (int i = 0; i < 64; i++) if (!used[i] && g_cs.op_b[i] && (bi < 0 || g_cs.op_b[i] > g_cs.op_b[bi])) bi = i; if (bi < 0) break; used[bi] = 1;
         k += snprintf(top + k, sizeof top - k, " 命令%d：%.0f 条×%.0f 字节=%.1f KB；", bi, g_cs.op_n[bi] / n, (double)g_cs.op_b[bi] / (double)g_cs.op_n[bi], g_cs.op_b[bi] / n / 1024.0); }
-    LOG("[nvn] 命令内存 至帧 %llu：每帧录 %.1f KB / %.0f 条；游戏给段 每帧 %.2f 次，每段 均 %.1f KB（最小 %.1f / 最大 %.1f）；补内存回调 每帧 %.2f 次；宿主补段 每帧 %.3f 次；换段丢弃的段尾 每帧 %.1f KB｜每帧%s",
-        (unsigned long long)f, g_cs.bytes / n / 1024.0, g_cs.recs / n, g_cs.grants / n, g_cs.grants ? g_cs.grant_bytes / (double)g_cs.grants / 1024.0 : 0, g_cs.grant_min / 1024.0, g_cs.grant_max / 1024.0, g_cs.cbs / n, g_cs.hostseg / n, g_cs.waste / n / 1024.0, top);
+    uint64_t lw_n, lw_b; dm_nvn_lww_stats(&lw_n, &lw_b);   // 同槽合并：本段每帧条数与字节，累计值 | Same-slot merges: records and bytes per frame in this span, plus the running total
+    LOG("[nvn] 命令内存 至帧 %llu：每帧录 %.1f KB / %.0f 条；游戏给段 每帧 %.2f 次，每段 均 %.1f KB（最小 %.1f / 最大 %.1f）；补内存回调 每帧 %.2f 次；宿主补段 每帧 %.3f 次；换段丢弃的段尾 每帧 %.1f KB；同槽合并 每帧 %.1f 条 / %.1f KB（累计 %llu 条 / %.1f KB）｜每帧%s",
+        (unsigned long long)f, g_cs.bytes / n / 1024.0, g_cs.recs / n, g_cs.grants / n, g_cs.grants ? g_cs.grant_bytes / (double)g_cs.grants / 1024.0 : 0, g_cs.grant_min / 1024.0, g_cs.grant_max / 1024.0, g_cs.cbs / n, g_cs.hostseg / n, g_cs.waste / n / 1024.0,
+        (double)(lw_n - g_lww_prev_n) / n, (double)(lw_b - g_lww_prev_b) / n / 1024.0, (unsigned long long)lw_n, (double)lw_b / 1024.0, top);
+    g_lww_prev_n = lw_n; g_lww_prev_b = lw_b;
     int on = g_cs.on; memset(&g_cs, 0, sizeof g_cs); g_cs.on = on; g_cs.frame0 = f; pthread_mutex_unlock(&g_cs_mu);
 }
-static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, size}; memcpy(p, &h, sizeof h); if (op) cs_op(op, size); }
+// 写记录头。非纯状态写的记录一律当屏障：把同槽合并表整体作废（见上面的不变式）
+// Write the record header. Any record that is not a pure state write counts as a barrier and invalidates the whole same-slot merge table (see the invariant above)
+static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, size}; memcpy(p, &h, sizeof h); if (op) cs_op(op, size); if (!lww_state_op(op)) lww_barrier(); }
 // 新段：录制中则在旧段尾写 JUMP 接上
 // New segment: if recording is in progress, write a JUMP at the end of the old segment to link it
 static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
     uint8_t *start = align8(mem), *end = mem + n;
     if (o->recording && o->cur) { if (cs_on() && o->end > o->cur) { pthread_mutex_lock(&g_cs_mu); g_cs.waste += (uint64_t)(o->end - o->cur); pthread_mutex_unlock(&g_cs_mu); } put_hdr(o->cur, OP_JUMP, 16); memcpy(o->cur + 8, &start, 8); }
+    lww_barrier();   // 换段（含未录制时首次给段）：旧段里的待合并槽全部作废 | Segment rollover (including the first grant while not recording): every pending slot in the old segment is dropped
     o->cur = start; o->end = end;
 }
 // 游戏自己的命令内存用完时的宿主补段：游戏的补内存回调在它那块命令内存池分不出来时，会拿空池（p = NULL、n = 0）调 AddCommandMemory
@@ -559,12 +653,14 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
         o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, size + OP_RESERVE, o->cb_data);
     }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.bytes += size; g_cs.recs++; pthread_mutex_unlock(&g_cs_mu); }
-    uint8_t *p = o->cur; o->cur += size; put_hdr(p, 0, size); return p;
+    // 只写 size：op 由调用方紧接的 put_hdr 写（每条记录都必写，且只有那里能判屏障） | Only the size is written here: the op follows from the caller's put_hdr (every record writes it, and only there can a barrier be judged)
+    uint8_t *p = o->cur; o->cur += size; ((op_hdr *)p)->size = size; return p;
 }
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1;
+    // OP_BEGIN 是屏障：开始录制即作废同槽合并表（上一次录制留下的槽不得跨录制合并） | OP_BEGIN is a barrier: starting to record invalidates the merge table (slots from the previous recording must not merge across)
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->begin = p;
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
@@ -605,18 +701,41 @@ NVN(nvnCommandBufferUpdateUniformBuffer, void, NVNcommandBuffer *c, NVNbufferAdd
 
 // ---------- 渲染命令：参数按 nvn_obj.h 的载荷格式录进命令内存，回放见 nvn_mtl.m ----------
 // ---------- Render commands: parameters are recorded into command memory in the payload format of nvn_obj.h; for replay see nvn_mtl.m ----------
-static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
+// key 非 0 = 这条记录写的是一个可分槽的状态槽：同槽的上一条记录还在（同一个命令缓冲、同键、同尺寸、中间没有屏障记录）就
+// 直接返回它的载荷让调用方就地写，不再占命令内存、不再多一条回放；否则照常录一条并把该槽指向新记录。
+// 返回旧载荷时调用方写进去的字节与「新录一条」完全相同：旧记录也是同一条路径录的（memset 过的空尾 + 同样的字段），
+// 键相同即尺寸与布局相同。
+// A non-zero key means this record writes a slot of a splittable state object: when the slot's previous record is still live (same command
+// buffer, same key, same size, no barrier record in between) its payload is returned so the caller writes it in place -- no command memory,
+// no extra replay. Otherwise a record is taken as usual and the slot points at the new record.
+// The bytes the caller writes into a returned payload are exactly those a fresh record would hold: the old record was produced by this same
+// path (a memset tail plus the same fields), and an identical key implies an identical size and layout.
+static void *rec_k(NVNcommandBuffer *c, uint32_t op, size_t payload, uint32_t key) {
     uint32_t sz = (uint32_t)((8 + payload + 7) & ~(size_t)7);
-    uint8_t *p = cmd_alloc(CB(c), sz); put_hdr(p, op, sz);
+    cmd_t *o = CB(c);
+    lww_slot_t *s = NULL;
+    if (key && lww_enabled()) {
+        s = &g_lww[lww_idx(o, key)];
+        if (s->gen == atomic_load_explicit(&g_lww_gen, memory_order_relaxed) && s->key == key && s->cb == o && s->size == sz) {
+            atomic_fetch_add_explicit(&g_lww_merged, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_lww_saved, sz, memory_order_relaxed);
+            return s->rec;
+        }
+    }
+    uint8_t *p = cmd_alloc(o, sz); put_hdr(p, op, sz);
     memset(p + 8, 0, sz - 8);
+    if (s && lww_enabled()) { s->gen = atomic_load_explicit(&g_lww_gen, memory_order_relaxed); s->key = key; s->cb = o; s->size = sz; s->rec = p + 8; }
     return p + 8;
 }
+static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) { return rec_k(c, op, payload, 0); }
 #define REC(c, OP, T) ((T *)rec((c), (OP), sizeof(T)))
+#define REC_K(c, OP, T, K) ((T *)rec_k((c), (OP), sizeof(T), (K)))
 // 带数组的绑定记录按实际个数分配：前缀字段 + n 个元素（回放端只读前 n 个）。原先按最大个数定长记（绑顶点缓冲 272 字节、绑贴图 / 采样器 280 字节，
 // 实际常只有 1–2 个），空尾占每帧命令字节的四到五成；88 级法师的高级属性页每帧录 12.5 MB，把游戏自己的命令内存池（约每帧 105 段 × 128 KB）用空
 // Binding records with arrays are allocated by the actual count: prefix fields + n elements (the replay side reads only the first n). Previously they were recorded at fixed length for the maximum count (bind vertex buffers 272 bytes, bind textures / samplers 280 bytes,
 // while there are usually only 1–2 in practice), and the empty tail took 40–50% of the command bytes per frame; the advanced stats page of the level 88 sorceress recorded 12.5 MB per frame, using up the game's own command memory pool (about 105 segments x 128 KB per frame)
 #define RECN(c, OP, T, ARR, N) ((T *)rec((c), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N)))
+#define RECN_K(c, OP, T, ARR, N, K) ((T *)rec_k((c), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N), (K)))
 static void copy_view(view_t *dst, uint8_t *has, const NVNtextureView *v) { *has = v != NULL; if (v) *dst = *(const view_t *)v; }
 NVN(nvnCommandBufferSetRenderTargets, void, NVNcommandBuffer *c, int n, const NVNtexture *const *ct, const NVNtextureView *const *cv,
     const NVNtexture *dt, const NVNtextureView *dv) {
@@ -633,15 +752,25 @@ NVN(nvnCommandBufferClearDepthStencil, void, NVNcommandBuffer *c, float depth, u
 }
 NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, const float *v) {
     if (n < 0 || first + n > 16) { LOG("【红】SetViewports first=%d n=%d", first, n); return; }
-    p_viewports *r = REC(c, OP_VIEWPORTS, p_viewports); r->first = first; r->n = n;
+    // 槽 = 视口区间（first, n）；回放写 S.vp[first..first+n) 并置 has_vp | Slot = the viewport range (first, n); replay writes S.vp[first..first+n) and sets has_vp
+    p_viewports *r = REC_K(c, OP_VIEWPORTS, p_viewports, lww_key(OP_VIEWPORTS, first, n, 0)); r->first = first; r->n = n;
     for (int i = 0; i < n; i++) memcpy(r->v[i], v + 4 * i, 16);
 }
-NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
-NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
+// 单槽状态：剪裁矩形 / 深度范围 / 多边形偏移 / 混合常量各占一个槽 | Single-slot state: scissor rect / depth range / polygon offset / blend constant each own one slot
+NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC_K(c, OP_SCISSOR, p_scissor, lww_key(OP_SCISSOR, 0, 0, 0)) = (p_scissor){x, y, w, h}; }
+NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC_K(c, OP_DEPTH_RANGE, p_depth_range, lww_key(OP_DEPTH_RANGE, 0, 0, 0)) = (p_depth_range){n, f}; }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
-    *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){snap_prog(p), stages};
+    // 槽键区分 stages：计算阶段（0x20）与渲染阶段（0x03 等）绝不合并，避免丢着色器 | The slot key distinguishes stages: compute (0x20) and graphics stages never merge, preventing dropped shaders
+    *REC_K(c, OP_BIND_PROGRAM, p_bind_program, lww_key(OP_BIND_PROGRAM, stages & 0xFF, 0, 0)) = (p_bind_program){snap_prog(p), stages};
 }
-static void bind_state(NVNcommandBuffer *c, int kind, const void *st, size_t n) { p_bind_state *r = REC(c, OP_BIND_STATE, p_bind_state); r->kind = kind; memcpy(r->bytes, st, n); }
+// 状态对象：blend 按目标序号分槽（回放写 S.blend[target]），其余 kind 各一个槽
+// State objects: blend is slotted by target index (replay writes S.blend[target]); every other kind owns one slot
+static uint32_t bind_state_key(int kind, const void *st) {
+    return kind == 0 ? lww_key(OP_BIND_STATE, 0, ((const blend_st *)st)->target, 0) : lww_key(OP_BIND_STATE, kind, 0, 0);
+}
+static void bind_state(NVNcommandBuffer *c, int kind, const void *st, size_t n) {
+    p_bind_state *r = REC_K(c, OP_BIND_STATE, p_bind_state, bind_state_key(kind, st)); r->kind = kind; memcpy(r->bytes, st, n);
+}
 NVN(nvnCommandBufferBindBlendState, void, NVNcommandBuffer *c, const NVNblendState *st) { bind_state(c, 0, st, sizeof(blend_st)); }
 NVN(nvnCommandBufferBindColorState, void, NVNcommandBuffer *c, const NVNcolorState *st) { bind_state(c, 1, st, sizeof(color_st)); }
 NVN(nvnCommandBufferBindChannelMaskState, void, NVNcommandBuffer *c, const NVNchannelMaskState *st) { bind_state(c, 2, st, sizeof(chmask_st)); }
@@ -650,31 +779,37 @@ NVN(nvnCommandBufferBindPolygonState, void, NVNcommandBuffer *c, const NVNpolygo
 NVN(nvnCommandBufferBindDepthStencilState, void, NVNcommandBuffer *c, const NVNdepthStencilState *st) { bind_state(c, 5, st, sizeof(ds_st)); }
 NVN(nvnCommandBufferBindVertexAttribState, void, NVNcommandBuffer *c, int n, const NVNvertexAttribState *st) {
     if (n < 0 || n > 16) { LOG("【红】BindVertexAttribState n=%d", n); return; }
-    p_bind_vattr *r = RECN(c, OP_BIND_VATTR, p_bind_vattr, st, n); r->first = 0; r->n = n; memcpy(r->st, st, 4 * n);
+    // 槽 = 属性区间（first 恒为 0, n）；回放写 S.attr[0..n) 并置 nattr | Slot = the attribute range (first is always 0, plus n); replay writes S.attr[0..n) and sets nattr
+    p_bind_vattr *r = RECN_K(c, OP_BIND_VATTR, p_bind_vattr, st, n, lww_key(OP_BIND_VATTR, 0, n, 0)); r->first = 0; r->n = n; memcpy(r->st, st, 4 * n);
 }
 NVN(nvnCommandBufferBindVertexStreamState, void, NVNcommandBuffer *c, int n, const NVNvertexStreamState *st) {
     if (n < 0 || n > 16) { LOG("【红】BindVertexStreamState n=%d", n); return; }
-    p_bind_vstream *r = RECN(c, OP_BIND_VSTREAM, p_bind_vstream, st, n); r->first = 0; r->n = n; memcpy(r->st, st, 8 * n);
+    // 槽 = 流区间（first 恒为 0, n） | Slot = the stream range (first is always 0, plus n)
+    p_bind_vstream *r = RECN_K(c, OP_BIND_VSTREAM, p_bind_vstream, st, n, lww_key(OP_BIND_VSTREAM, 0, n, 0)); r->first = 0; r->n = n; memcpy(r->st, st, 8 * n);
 }
 NVN(nvnCommandBufferBindVertexBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *rg) {
     if (n < 0 || first + n > 16) { LOG("【红】BindVertexBuffers first=%d n=%d", first, n); return; }
-    p_bind_vbuf *r = RECN(c, OP_BIND_VBUF, p_bind_vbuf, r, n); r->first = first; r->n = n; memcpy(r->r, rg, sizeof *rg * n);
+    // 槽 = 顶点缓冲区间（first, n）；回放只写 S.vbuf[first..first+n) | Slot = the vertex buffer range (first, n); replay writes only S.vbuf[first..first+n)
+    p_bind_vbuf *r = RECN_K(c, OP_BIND_VBUF, p_bind_vbuf, r, n, lww_key(OP_BIND_VBUF, first, n, 0)); r->first = first; r->n = n; memcpy(r->r, rg, sizeof *rg * n);
 }
+// 槽 = 阶段 + 序号（回放写 S.ubo / S.ssbo[stage][index]） | Slot = stage + index (replay writes S.ubo / S.ssbo[stage][index])
 NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
-    *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
+    *REC_K(c, OP_BIND_UBO, p_bind_buf, lww_key(OP_BIND_UBO, st, i, 0)) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindUniformBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
-    for (int i = 0; i < n; i++) *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
+    for (int i = 0; i < n; i++) *REC_K(c, OP_BIND_UBO, p_bind_buf, lww_key(OP_BIND_UBO, st, first + i, 0)) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
 }
 NVN(nvnCommandBufferBindStorageBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
-    *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
+    *REC_K(c, OP_BIND_SSBO, p_bind_buf, lww_key(OP_BIND_SSBO, st, i, 0)) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindStorageBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
-    for (int i = 0; i < n; i++) *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
+    for (int i = 0; i < n; i++) *REC_K(c, OP_BIND_SSBO, p_bind_buf, lww_key(OP_BIND_SSBO, st, first + i, 0)) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
 }
+// 槽 = 阶段 + 区间（first, n）。区间不同（含部分重叠）一律不合并，整段记录原样保留
+// Slot = stage + range (first, n). Different ranges (partially overlapping ones included) are never merged; the whole record is kept as is
 static void bind_handles(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h) {
     if (n < 0 || n > 32) { LOG("【红】绑定句柄数 %d", n); return; }
-    p_bind_handles *r = RECN(c, op, p_bind_handles, h, n); r->stage = st; r->first = first; r->n = n; memcpy(r->h, h, 8 * n);
+    p_bind_handles *r = RECN_K(c, op, p_bind_handles, h, n, lww_key(op, st, first, n)); r->stage = st; r->first = first; r->n = n; memcpy(r->h, h, 8 * n);
 }
 // 图像（可写贴图）：句柄 = 贴图池号（GetImageHandle 原样返回；游戏不调 RegisterImage，图像与贴图共用登记）
 // Image (writable texture): handle = texture pool index (GetImageHandle returns it as-is; the game does not call RegisterImage, images and textures share registration)
@@ -690,11 +825,13 @@ NVN(nvnCommandBufferBindSeparateSamplers, void, NVNcommandBuffer *c, NVNshaderSt
 NVN(nvnCommandBufferBindSeparateSampler, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNseparateSamplerHandle h) {
     bind_handles(c, OP_BIND_SAMP, st, i, 1, &h.value);
 }
-NVN(nvnCommandBufferSetStencilValueMask, void, NVNcommandBuffer *c, NVNface f, int m) { *REC(c, OP_STENCIL, p_stencil) = (p_stencil){f, m, 0, 0, 0}; }
-NVN(nvnCommandBufferSetStencilMask, void, NVNcommandBuffer *c, NVNface f, int m) { *REC(c, OP_STENCIL, p_stencil) = (p_stencil){f, 0, m, 0, 1}; }
-NVN(nvnCommandBufferSetStencilRef, void, NVNcommandBuffer *c, NVNface f, int v) { *REC(c, OP_STENCIL, p_stencil) = (p_stencil){f, 0, 0, v, 2}; }
+// 槽 = which（值掩码 / 写掩码 / 参考值）+ 面掩码；回放按面掩码写 S.st_vmask / st_wmask / st_ref
+// Slot = which (value mask / write mask / reference value) + the face mask; replay writes S.st_vmask / st_wmask / st_ref per face bit
+NVN(nvnCommandBufferSetStencilValueMask, void, NVNcommandBuffer *c, NVNface f, int m) { *REC_K(c, OP_STENCIL, p_stencil, lww_key(OP_STENCIL, 0, f, 0)) = (p_stencil){f, m, 0, 0, 0}; }
+NVN(nvnCommandBufferSetStencilMask, void, NVNcommandBuffer *c, NVNface f, int m) { *REC_K(c, OP_STENCIL, p_stencil, lww_key(OP_STENCIL, 1, f, 0)) = (p_stencil){f, 0, m, 0, 1}; }
+NVN(nvnCommandBufferSetStencilRef, void, NVNcommandBuffer *c, NVNface f, int v) { *REC_K(c, OP_STENCIL, p_stencil, lww_key(OP_STENCIL, 2, f, 0)) = (p_stencil){f, 0, 0, v, 2}; }
 NVN(nvnCommandBufferSetPolygonOffsetClamp, void, NVNcommandBuffer *c, float fa, float un, float cl) {
-    *REC(c, OP_POLY_OFFSET, p_poly_offset) = (p_poly_offset){fa, un, cl};
+    *REC_K(c, OP_POLY_OFFSET, p_poly_offset, lww_key(OP_POLY_OFFSET, 0, 0, 0)) = (p_poly_offset){fa, un, cl};
 }
 NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n) { *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n}; }
 NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
@@ -731,9 +868,11 @@ NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNte
     p_copy_t2t *o = REC(c, OP_COPY_T2T, p_copy_t2t); o->src = snap_tex(s); o->dst = snap_tex(d);
     copy_view(&o->sv, &o->has_sv, sv); copy_view(&o->dv, &o->has_dv, dv); o->sr = *sr; o->dr = *dr; o->flags = flags;
 }
-NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_STRIDE, p_copy_stride)->stride = st; }
-NVN(nvnCommandBufferSetCopyImageStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_IMAGE_STRIDE, p_copy_stride)->stride = st; }
-NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
+// 拷贝行距：各一个槽（纯状态写）。实际上它们总是紧贴一次拷贝记录，所以基本不会命中合并
+// Copy strides: one slot each (pure state writes). In practice they always sit right next to a copy record, so a merge almost never hits
+NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC_K(c, OP_COPY_STRIDE, p_copy_stride, lww_key(OP_COPY_STRIDE, 0, 0, 0))->stride = st; }
+NVN(nvnCommandBufferSetCopyImageStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC_K(c, OP_COPY_IMAGE_STRIDE, p_copy_stride, lww_key(OP_COPY_IMAGE_STRIDE, 0, 0, 0))->stride = st; }
+NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC_K(c, OP_BLEND_COLOR, p_blend_color, lww_key(OP_BLEND_COLOR, 0, 0, 0))->rgba, v, 16); }
 
 // ---------- 状态对象：就地打包（nvn_obj.h） ----------
 // ---------- State objects: packed in place (nvn_obj.h) ----------
@@ -807,6 +946,17 @@ static uint64_t thr_sys_ns(void) {
     mach_port_deallocate(mach_task_self(), me); return r;
 }
 static _Atomic uint64_t g_cum_sub_cyc, g_cum_sub_sys_ns, g_cum_sub_wall_ns;
+// 核号分布：线程在哪个逻辑 CPU 上（pthread_cpu_number_np，iOS 14.2+），主线程每帧取一次、翻译线程每次提交取一次，每 300 帧记一行原始计数；
+// 与 hw.perflevelN.logicalcpu 和 [诊断] 功耗行的 P/E 核主频对照，分「整机降频」还是「线程被放到能效核」
+// Core-number histogram: which logical CPU the thread is on (pthread_cpu_number_np, iOS 14.2+); the main thread samples once per frame, the translation thread once per submit; one line of raw counts every 300 frames;
+// compared with hw.perflevelN.logicalcpu and the P/E core clocks on the [诊断] power line, to tell "whole-chip downclocking" from "thread placed on efficiency cores"
+#define CPUN 16
+static _Atomic uint32_t g_cpu_main[CPUN], g_cpu_xlat[CPUN];
+static void cpu_sample(_Atomic uint32_t *h) { size_t c = 0; if (pthread_cpu_number_np(&c) == 0) atomic_fetch_add_explicit(&h[c < CPUN ? c : CPUN - 1], 1, memory_order_relaxed); }
+static void cpu_hist_fmt(_Atomic uint32_t *h, char *b, size_t n) {
+    b[0] = 0; for (int i = 0; i < CPUN; i++) { uint32_t v = atomic_exchange_explicit(&h[i], 0, memory_order_relaxed); if (v) { char t[24]; snprintf(t, sizeof t, " c%d:%u", i, v); strlcat(b, t, n); } }
+    if (!b[0]) strlcpy(b, " 无样本", n);
+}
 static int frame_rec(void);
 static _Atomic uint64_t g_nvn_ns;   // 本帧在提交 / 出图里花的宿主时间（回放编码 + 出图），计时埋点用 | Host time spent in submit / present this frame (replay encoding + present), used by the timing instrumentation
 
@@ -846,7 +996,7 @@ static int xlat_rt_on(void);
 // which must not be changed by the game thread in the middle of translation. DM_NVN_SYNC=1: jobs run in place on the calling thread (the same execution function), as the control and measurement baseline.
 enum { XJ_SUBMIT, XJ_PRESENT, XJ_FRAME };
 typedef struct { int kind, n; uint64_t *h; const tex_t *tex; double period; int crop[4]; uint64_t frame, sub, host; } xjob;   // host：入队时锁存的宿主画法开关 | host: host drawing switches latched at enqueue
-#define XQ 32
+#define XQ 128
 #define XTK 1024
 static xjob g_xq[XQ]; static uint64_t g_xq_in, g_xq_done;   // 入队任务数 / 已执行任务数（任务号从 1 计） | Jobs enqueued / jobs executed (job numbers start at 1)
 static struct { uint64_t job, tk; } g_xtk[XTK];               // 出图任务号 → 出图线程票号 | Present job number -> present thread ticket
@@ -866,6 +1016,7 @@ static void x_submit(const uint64_t *h, int n, uint64_t sub, uint64_t host) {
     atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
     uint64_t i1, y1; thr_counts(&i1, &y1); uint64_t dc = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, di = i1 - i0;
     atomic_fetch_add(&g_cum_sub_cyc, y1 - y0); atomic_fetch_add(&g_cum_sub_sys_ns, thr_sys_ns() - s0); atomic_fetch_add(&g_cum_sub_wall_ns, dw);
+    cpu_sample(g_cpu_xlat);
     atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
     atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
 }
@@ -1027,6 +1178,7 @@ static void trow(uint64_t f, const char *name, double v);
 static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 static uint64_t present_link_timeout(const win_t *o);
+__attribute__((weak)) void dm_main_yield_slow_stats(uint64_t *n, uint64_t *ns, uint64_t *max, uint64_t *rt_off) { *n = 0; *ns = 0; *max = 0; *rt_off = 0; }   // 同上，hle_thread.c 提供 | Same as above, provided by hle_thread.c
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) void dm_main_block_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
@@ -1233,13 +1385,17 @@ static void tsummary(uint64_t frame) {
           qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0; pthread_get_qos_class_np(pthread_self(), &qc, &rp);
           uint64_t aw = 0, ag = 0; int an = 0; void mtl_alloc_stats(uint64_t *, uint64_t *, int *); mtl_alloc_stats(&aw, &ag, &an);
           static uint64_t pyn, pyns; uint64_t yn = 0, yns = 0; dm_main_yield_stats(&yn, &yns);
-          // 拓扑探测与频率统计：保留实测主频与 hw.nperflevels 原始拓扑数值，不做能效核/性能核位置推断。
-          // Topology and frequency statistics: preserve measured clock and raw hw.nperflevels topology value, no core-location inference.
+          // 拓扑探测与频率统计：保留实测主频与 hw.nperflevels / perflevelN 原始拓扑数值；核号→档位的对应只靠原始数据事后对照，这里不推断。
+          // Topology and frequency statistics: preserve measured clock and raw hw.nperflevels / perflevelN topology values; mapping core numbers to levels is left to after-the-fact comparison of raw data, not inferred here.
           double ghz = cpu > 0 ? cyc / cpu : 0;
           { static int logged; if (!logged) { logged = 1; int lv = 0; size_t ln_ = sizeof lv;
-              if (sysctlbyname("hw.nperflevels", &lv, &ln_, NULL, 0) == 0 && lv > 0)
-                  LOG("[nvn] 拓扑探测：hw.nperflevels=%d", lv);
-              else
+              if (sysctlbyname("hw.nperflevels", &lv, &ln_, NULL, 0) == 0 && lv > 0) {
+                  char b[256] = ""; for (int k = 0; k < lv && k < 4; k++) { char nm[64], q[96], name[32] = "?"; int lc = -1; size_t l1 = sizeof lc, l2 = sizeof name;
+                      snprintf(nm, sizeof nm, "hw.perflevel%d.logicalcpu", k); sysctlbyname(nm, &lc, &l1, NULL, 0);
+                      snprintf(nm, sizeof nm, "hw.perflevel%d.name", k); if (sysctlbyname(nm, name, &l2, NULL, 0)) strlcpy(name, "?", sizeof name);
+                      snprintf(q, sizeof q, "；perflevel%d %s %d 核", k, name, lc); strlcat(b, q, sizeof b); }
+                  LOG("[nvn] 拓扑探测：hw.nperflevels=%d%s", lv, b);
+              } else
                   LOG("[nvn] 拓扑探测：hw.nperflevels=unknown"); } }
           LOG("[nvn] 翻译细项 至帧 %llu：每帧提交 周期 %.2f M（每条指令 %.2f 周期）、CPU %.3f ms 其中内核态 %.3f ms、墙钟 %.3f ms；平均主频 %.2f GHz（周期 / CPU 时间）；本线程 QoS %#x；分配器池 %d 个、累计等 GPU %llu 次；实时声明计算 %.2f ms；主线程让出 每帧 %.0f 次 / %.3f ms", frame,
               cyc / 1e6 / nf, cyc / (double)(ci - pi), cpu / 1e6 / nf, (double)(ck - pk) / 1e6 / nf, (double)(cw - pw) / 1e6 / nf, ghz,
@@ -1312,12 +1468,39 @@ static void slow_emit(uint64_t f) {
 static void set_time_constraint_comp(rt_decl *d, uint64_t period_ns, uint64_t comp_ns) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     if (comp_ns < 1000000ull) comp_ns = 1000000ull; if (comp_ns > period_ns * 9 / 10) comp_ns = period_ns * 9 / 10;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     thread_time_constraint_policy_data_t p = {
         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
         .constraint = (uint32_t)(period_ns * tb.denom / tb.numer), .preemptible = 1};
     kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
     if (kr == KERN_SUCCESS) { d->comp_ms = comp_ns / 1e6; d->period_ms = period_ns / 1e6; }
     LOG("[nvn] %s时间约束策略（周期 %.3f ms、计算 %.3f ms）%s", d->who, period_ns / 1e6, comp_ns / 1e6, kr == KERN_SUCCESS ? "已设" : "设置失败");
+}
+// 优化计数（缺省开，每 300 帧一行）：这是「改的东西到底有没有生效」在真机上唯一的读数——真机设不了 DM_* 环境变量，
+// 而同槽合并 / 同绘制去重的计数原先只在 DM_NVN_CMDSTAT 门控的路径里。判读：参数块复用率、去重次数、归档 hits/added 是否随第二次启动上升。
+// Optimization counters (on by default, one line every 300 frames): on a device this is the only reading of whether the changes actually
+// take effect - DM_* environment variables cannot be set there, and the same-slot-merge / duplicate-draw counters used to live only on a
+// path gated by DM_NVN_CMDSTAT. How to read it: argument-buffer reuse ratio, duplicate-draw count, and whether archive hits/added rise on
+// the second launch.
+static void osummary(uint64_t frame) {
+    static uint64_t pdup, penc, preuse, plw_n, plw_b, pfill, pmemo, pfix;
+    uint64_t dup = 0, enc = 0, reuse = 0, lwn = 0, lwb = 0, fill = 0, memo = 0;
+    uint64_t fix = mtl_intfix_count();   // 整数顶点格式重试成功数：非 0 就说明真机确实在拒绝「归一化格式 + int4/uint4」 | non-zero proves the device really rejects "normalized format + int4/uint4"
+    mtl_dup_draw_stats(&dup);
+    mtl_args_stats(&enc, &reuse);
+    mtl_drv_fill_stats(&fill);
+    mtl_addr_memo_stats(&memo);
+    dm_nvn_lww_stats(&lwn, &lwb);
+    nvn_pcache_status pcs; memset(&pcs, 0, sizeof pcs); nvn_pcache_snapshot(&pcs);
+    double ae = (double)(enc - penc), ar = (double)(reuse - preuse);
+    LOG("[nvn] 优化计数 至帧 %llu：同绘制去重 %llu 次（%s）；整数顶点格式重试 %llu 条（累计 %llu）；参数块 新编 %.0f / 复用 %.0f（复用率 %.1f%%）；驱动常量段重建 %.0f；地址解析命中 %.0f；同槽合并 本段 %.0f 条 / %.1f KB；归档 hits %llu / misses %llu / added %llu / bypassed %llu / 忙跳过 %llu / 已载入 %d / 已写盘 %llu",
+        (unsigned long long)frame, (unsigned long long)(dup - pdup), mtl_dup_draw_on() ? "开" : "关",
+        (unsigned long long)(fix - pfix), (unsigned long long)fix,
+        ae, ar, (ae + ar) > 0 ? 100.0 * ar / (ae + ar) : 0.0, (double)(fill - pfill), (double)(memo - pmemo),
+        (double)(lwn - plw_n), (lwb - plw_b) / 1024.0,
+        (unsigned long long)pcs.hits, (unsigned long long)pcs.misses, (unsigned long long)pcs.added, (unsigned long long)pcs.bypassed,
+        (unsigned long long)pcs.busy, pcs.loaded, (unsigned long long)pcs.saved);
+    pdup = dup; penc = enc; preuse = reuse; pfill = fill; pmemo = memo; plw_n = lwn; plw_b = lwb; pfix = fix;
 }
 static int rt_comp_fixed_ms(void) { static int v = -2; if (v == -2) { const char *e = getenv("DM_RT_COMP"); v = e && *e && strcmp(e, "auto") ? atoi(e) : -1; } return v; }   // −1 = auto
 // 翻译线程是否也参与实时配额：缺省不参与。主线程与翻译线程各自按 0.9 × 周期声明时，两者相加可达 1.8 × 周期，
@@ -1331,10 +1514,10 @@ static void set_time_constraint(rt_decl *d, uint64_t period_ns) {
     int f = rt_comp_fixed_ms();
     // A30/60 switch changes the deadline, not the learned amount of CPU work.
     // Retain the estimate (clamped by setter), discard the mixed-period sample window.
-    uint64_t comp = f > 0 ? (uint64_t)f * 1000000ull : d->comp_ms > 0 ? (uint64_t)(d->comp_ms * 1e6) : 2000000ull;
+    uint64_t comp = f > 0 ? (uint64_t)f * 1000000ull : d->comp_ms > 0 ? (uint64_t)(d->comp_ms * 1e6) : (period_ns * 5 / 10);
     if (d->period_ms != period_ns / 1e6) { d->last = 0; d->n = 0; }
     set_time_constraint_comp(d, period_ns, comp);
-}   // 首次：固定值，或 auto 的起始值 2 ms | first time: the fixed value, or auto's starting value of 2 ms
+}   // 首次：固定值，或 auto 的起始值 0.5 × 周期 | first time: the fixed value, or auto's starting value of 0.5 × period
 // 每帧在取图处调：记本线程自上次以来的 CPU 时间；auto 模式下按 p90 重新声明
 // Called every frame at acquire: records this thread's CPU time since the last call; in auto mode re-declares based on p90
 static void rt_comp_tick(rt_decl *d, uint64_t period_ns) {   // 在被声明的那条线程上调（读本线程 CPU 时钟） | Call on the thread being declared (reads this thread's CPU clock)
@@ -1343,7 +1526,8 @@ static void rt_comp_tick(rt_decl *d, uint64_t period_ns) {   // 在被声明的�
     d->win[d->n++] = (double)(c - d->last) / 1e6; d->last = c;
     if (d->n < 120) return;
     double v[120]; memcpy(v, d->win, sizeof v); qsort(v, 120, sizeof *v, dcmp); d->n = 0;
-    double p90 = v[107], comp = p90 * 1.25, cap = period_ns * 0.9 / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
+    double p90 = v[107], comp = p90 * 1.25, cap = period_ns * 0.9 / 1e6, floor_ms = period_ns * 0.4 / 1e6;
+    if (comp > cap) comp = cap; if (comp < floor_ms) comp = floor_ms;
     if (comp > d->comp_ms * 1.15 || comp < d->comp_ms * 0.85) set_time_constraint_comp(d, period_ns, (uint64_t)(comp * 1e6));
 }
 static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 | absolute time on the monotonic clock
@@ -1549,9 +1733,15 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();
-    if (g_frame % TWIN == 0) tsummary(g_frame);
+    if (g_frame % TWIN == 0) { tsummary(g_frame); osummary(g_frame); }
     { static uint64_t pc, py, pf; uint64_t i_, y_, c_ = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID); thr_counts(&i_, &y_);   // 主线程（游戏线程）的每帧 CPU 与平均主频：与「翻译细项」行的翻译线程对照，分「整机降频」还是「翻译线程被放小核」 | Per-frame CPU and average clock of the main (game) thread: compared with the translation thread on the "translation detail" line, to tell "whole-chip downclocking" from "translation thread placed on an efficiency core"
-      if (g_frame % TWIN == 0) { if (pf && g_frame > pf && c_ > pc) LOG("[nvn] 主线程 至帧 %llu：每帧 CPU %.2f ms，平均主频 %.2f GHz（周期 / CPU 时间）", g_frame, (c_ - pc) / 1e6 / (double)(g_frame - pf), (double)(y_ - py) / (double)(c_ - pc)); pc = c_; py = y_; pf = g_frame; } }
+      cpu_sample(g_cpu_main);
+      if (g_frame % TWIN == 0) { if (pf && g_frame > pf && c_ > pc) LOG("[nvn] 主线程 至帧 %llu：每帧 CPU %.2f ms，平均主频 %.2f GHz（周期 / CPU 时间）", g_frame, (c_ - pc) / 1e6 / (double)(g_frame - pf), (double)(y_ - py) / (double)(c_ - pc)); pc = c_; py = y_; pf = g_frame;
+        char hm[192], hx[192]; cpu_hist_fmt(g_cpu_main, hm, sizeof hm); cpu_hist_fmt(g_cpu_xlat, hx, sizeof hx);
+        LOG("[nvn] 核号分布 至帧 %llu：主线程%s；翻译线程%s", g_frame, hm, hx);
+        static uint64_t psn, pss, psr; uint64_t sn, ss, sm, sr; dm_main_yield_slow_stats(&sn, &ss, &sm, &sr);
+        LOG("[nvn] 主线程慢让出 至帧 %llu：>2ms %llu 次 共 %.1f ms，最长 %.1f ms，其中实时策略不在生效 %llu 次", g_frame,
+            (unsigned long long)(sn - psn), (ss - pss) / 1e6, sm / 1e6, (unsigned long long)(sr - psr)); psn = sn; pss = ss; psr = sr; } }
     { xjob j = {XJ_FRAME}; j.frame = g_frame; j.period = present_period(o) / 1e9; x_push(&j); }   // 帧号随队列生效（见翻译队列说明） | The frame number takes effect in queue order (see the translation queue notes)
     // 真机语义：出图只入队、立即返回；本帧显示时刻按节拍器排，该贴图到「显示时刻 + 一个周期」才可再获取（阻塞在 AcquireTexture）
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)

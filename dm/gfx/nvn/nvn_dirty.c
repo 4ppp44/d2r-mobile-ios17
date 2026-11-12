@@ -72,9 +72,16 @@ static range_t *find(uintptr_t a) {
     for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) return &g_r[i];
     return NULL;
 }
+static void stamp_page(range_t *r, uintptr_t p) {
+    atomic_store(&r->gen[p], atomic_fetch_add(&g_now, 1) + 1);
+    // 代号写完后再推一次时钟以发布完成：检查方可能在写代号前用刚加过的时钟缓存了「干净」。缺页和宿主写两路都必须使该缓存时钟失效，因为在下次上传重新保护前页面始终可写。
+    // Publish completion after the generation: a checker may have cached "clean" using the incremented clock before the generation store. Both fault and host-write paths
+    // must invalidate that cached clock, as the page stays writable until the next upload protects it again.
+    atomic_fetch_add(&g_now, 1);
+}
 static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态从 PROT 改成 BUSY | The caller has already changed the state from PROT to BUSY
     mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
-    atomic_store(&r->gen[p], atomic_fetch_add(&g_now, 1) + 1);
+    stamp_page(r, p);
     atomic_store(&r->state[p], PG_NONE);
 }
 static int on_fault(void *addr, int is_write, void *uc) {
@@ -87,17 +94,36 @@ static int on_fault(void *addr, int is_write, void *uc) {
     if (st == PG_BUSY) return busy_wait(r, p);   // 别的线程正在改这页的保护：等它改完重执行（改成了只读就再缺页一次、走上面那一支） | Another thread is changing this page's protection: wait for it to finish and re-execute (if it became read-only, it faults once more and takes the branch above)
     return atomic_load(&r->gen[p]) != 0;   // 刚被别的线程解掉（本次缺页发生在解之前）：重执行；从未保护过的页不是我们的 | Just unprotected by another thread (this fault happened before the unprotect): re-execute; pages that were never protected are not ours
 }
+// 连续置成可写的页合成一次 mprotect（宿主整张贴图写，例如 WriteTexels，原先每 16 KB 页一次系统调用：织梦岛一帧约 275 次）。别的线程正在改的页在当前连续段处理完后逐页处理，等待时不持有 BUSY 页
+// Unprotect pages p..q of a range with one mprotect per run of protected pages (a host write over a whole texture, e.g. WriteTexels, used to make one system call per 16 KB page:
+// Link's Awakening, about 275 a frame). Pages another thread is changing are handled one by one after the run so far is finished, so no BUSY page is held while waiting
+static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t *count) {
+    uintptr_t run = 0; int open = 0;
+    for (uintptr_t i = p; i <= q + 1; i++) {
+        uint8_t st = PG_PROT; int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
+        if (took) { if (!open) { run = i; open = 1; } continue; }
+        if (open) {
+            mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ | PROT_WRITE);
+            for (uintptr_t k = run; k < i; k++) { stamp_page(r, k); atomic_store(&r->state[k], PG_NONE); }
+            if (count) atomic_fetch_add(count, i - run);
+            open = 0;
+        }
+        if (i <= q && st == PG_BUSY) {
+            for (;;) {
+                uint8_t s = PG_PROT;
+                if (atomic_compare_exchange_strong(&r->state[i], &s, PG_BUSY)) { unprotect_page(r, i); if (count) atomic_fetch_add(count, 1); break; }
+                if (s != PG_BUSY || !busy_wait(r, i)) break;
+            }
+        }
+    }
+}
 static void prep_write(void *addr, size_t len) {
     uintptr_t a = (uintptr_t)addr, e = a + len;
     while (len && a < e) {
         range_t *r = find(a);
         if (!r) { a = (a + g_pg) & ~(g_pg - 1); continue; }
         uintptr_t stop = e < r->end ? e : r->end;
-        for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q; p++) {
-            for (;;) { uint8_t st = PG_PROT;   // 见 BUSY 等完要重看：对方可能是在设只读，等完这页是 PROT，照样得解 | After waiting out BUSY, look again: the other side may have been setting read-only, in which case the page is PROT after the wait and still has to be unprotected
-                if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_preps, 1); break; }
-                if (st != PG_BUSY || !busy_wait(r, p)) break; }
-        }
+        release_pages(r, (a - r->base) >> g_shift, (stop - 1 - r->base) >> g_shift, &g_preps);
         a = stop;
     }
 }
@@ -156,15 +182,19 @@ void nvn_dirty_protect(const void *addr, size_t len) {
     range_t *r = find((uintptr_t)addr);
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     // 连续置成 PROT 的页合成一次 mprotect（逐页调用在首传大贴图时一帧上千次；选角页启动帧 5：4888 次）。
-    // 已是 PROT / BUSY 的页断开连续段：不重复保护，也不碰别的线程正在改的页
+    // 已是 PROT / BUSY 的页断开连续段：不重复保护，也不碰别的线程正在改的页。
+    // BUSY 的页等它改完（先保护好当前连续段，等待期间不持有 BUSY）再重看：解保护进行中的页会变成可写，若跳过则其代号可能被调用方的戳覆盖，后续写入永不缺页而导致贴图常旧（MacNativeGames a166602）
     // Consecutive pages set to PROT are merged into one mprotect (per-page calls ran to over a thousand per frame when large textures were first uploaded; character select, startup frame 5: 4888 calls).
-    // Pages already PROT / BUSY break a run: they are not protected again, and pages another thread is changing are left alone
+    // Pages already PROT / BUSY break a run: they are not protected again, and pages another thread is changing are left alone.
+    // A BUSY page is waited out (the run so far is protected first, so none of ours is BUSY meanwhile) and looked at again: an unprotect in progress leaves the page writable
+    // with a generation the caller's stamp may cover, so skipped, its later writes never faulted and the texture stayed stale (MacNativeGames a166602)
     uintptr_t run = 0; int open = 0;
     for (uintptr_t i = p; i <= q + 1; i++) {
         uint8_t st = PG_NONE;
         int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
         if (took && !open) { run = i; open = 1; }
         if (!took && open) { mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
+        if (!took && i <= q && st == PG_BUSY && busy_wait(r, i)) i--;   // 这一页重看 | this page again
     }
 }
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }

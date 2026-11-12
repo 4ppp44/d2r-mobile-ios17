@@ -39,8 +39,23 @@ static result run_case(int mode,prog_t pg[2],int sample_base){
     if(mode==COPY_DEST)copy_t2t_cmd(&c,&src,&dst);else if(mode==DEPTH_CLEAR){p_clear_tex x={.tex=&dst,.mask=15,.is_uint=0};x.has_view=1;x.view.set_levels=1;x.view.nlevels=1;x.r=(NVNcopyRegion){0,0,0,8,8,1};x.c.f[0]=.5f;emit(&c,OP_CLEAR_TEX,&x,sizeof x);}else clear_tex_cmd(&c,&dst,mode==PARTIAL_CLEAR?1:mode==OTHER_MIP?2:mode==FORMAT_VIEW?3:0);
     emit(&c,OP_END,NULL,0);mtl_sub_begin();uint64_t hh=(uint64_t)c.p;mtl_sub_index(&hh,1);uint64_t s0=g_bw_store;mtl_exec(c.p);rp_flush();result r={.store=g_bw_store-s0};if(mode==DEPTH_CLEAR){uint64_t f=mtl_sub_commit();EXPECT("提交完成",1,mtl_wait(f,5000000000ull));EXPECT("提交反馈无错误",0,mtl_last_commit_error());}else read_color(&dst,r.color);return r;
 }
+// A no-view depth clear targets mip 0 only. It cannot kill mip 1's store.
+static void depth_default_view_scope(void) {
+    tex_t d=texture(99000,NVN_FORMAT_DEPTH32F_STENCIL8,2);code c=code_new();
+    p_set_rt mip=rt_depth(&d);mip.dview.base_level=1;
+    set_rt(&c,mip);clear_ds(&c);
+    p_set_rt base={.depth=&d};set_rt(&c,base);clear_ds(&c);emit(&c,OP_END,NULL,0);
+    state_reset();memset(&R,0,sizeof R);g_vis_on=g_vis_counting=0;
+    mtl_sub_begin();uint64_t h=(uint64_t)c.p;mtl_sub_index(&h,1);uint64_t before=g_bw_store;mtl_exec(c.p);rp_flush();
+    EXPECT("default depth clear preserves other mip store",400,g_bw_store-before);
+    id<MTLBuffer> b=[g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    [blit() copyFromTexture:tex_mtl(&d) sourceSlice:0 sourceLevel:1 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(4,4,1) toBuffer:b destinationOffset:0 destinationBytesPerRow:16 destinationBytesPerImage:64 options:MTLBlitOptionDepthFromDepthStencil];
+    uint64_t f=mtl_sub_commit();EXPECT("depth mip commit completed",1,mtl_wait(f,5000000000ull));EXPECT("depth mip GPU error",0,mtl_last_commit_error());
+    int bad=0;for(int i=0;i<16;i++)bad+=((float *)b.contents)[i]!=.25f;EXPECT("other mip real depth pixels survive",0,bad);
+}
 static NvProg *g_tkeep[256]; static int g_tnkeep;
 int main(void){@autoreleasepool{setvbuf(stdout,NULL,_IONBF,0);setenv("DM_NVN_TBDR","1",1);setenv("DM_NVN_XV","0",1);mtl_init();NSError *e=nil;id<MTLLibrary>l=[g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;vertex float4 v(uint n[[vertex_id]]){float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)};return float4(p[n],0,1);}\nfragment float4 blue(){return float4(0,0,1,1);}\nstruct A{texture2d<float> t[[id(0)]];};fragment float4 sample(constant A&a[[buffer(0)]]){return a.t.read(uint2(0));}\n" options:nil error:&e];if(!l){fprintf(stderr,"%s\n",e.localizedDescription.UTF8String);return 2;}static prog_t pg[2]={{.serial=91000},{.serial=91001}};for(int i=0;i<2;i++){NvProg*p=[NvProg new];p->sh[0]=[NvShader new];p->sh[0]->fn=[l newFunctionWithName:@"v"];p->sh[1]=[NvShader new];p->sh[1]->stage=1;p->sh[1]->fn=[l newFunctionWithName:i?@"sample":@"blue"];p->sh[1]->rf.color_mask=1;if(i){p->sh[1]->rf.nb=1;p->sh[1]->rf.b[0]=(nvn_rbind){.kind=NVN_RB_TEX,.reg=0,.dtt=MTLTextureType2D};p->sh[1]->ae=[p->sh[1]->fn newArgumentEncoderWithBufferIndex:0];}if(g_tnkeep<256)g_tkeep[g_tnkeep++]=p;serial_put(pg[i].serial,p);}int sample_base=2400;
+    depth_default_view_scope();
     result full=run_case(FULL_CLEAR,pg,sample_base);expect_rgba("整级ClearTexture最终黄色",full.color,255,255,0);EXPECT("整级ClearTexture省前通道Store",256,full.store);
     result partial=run_case(PARTIAL_CLEAR,pg,sample_base);EXPECT("部分ClearTexture保守Store",512,partial.store);
     result mip=run_case(OTHER_MIP,pg,sample_base);EXPECT("另一mip ClearTexture保守Store",512,mip.store);

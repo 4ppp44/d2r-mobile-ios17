@@ -226,7 +226,7 @@ static double s3_rate(const scale3d_ctl *c, int k) {   // 最近 k 窗的掉帧�
 static int s3_gpu_bound(const scale3d_ctl *c, int up) {
     if (c->gpu_ms <= 0) return 1;   // 无读数：退回旧规则（掉帧就降） | no reading: fall back to the old rule (lower on drops)
     double per = c->period_ms > 0 ? c->period_ms : 1000.0 / 60;
-    return c->gpu_ms >= (up ? 0.65 : 0.75) * per;
+    return c->gpu_ms >= (up ? 0.65 : 0.82) * per;
 }
 static int scale3d_ctl_step(scale3d_ctl *c, double iv_ms, uint64_t now) {   // 返回当前级 | returns the current level
     if (now < c->hold_until || iv_ms == 0) return c->level;   // 停判中 / 无读数（0） | Judging paused / no reading (0)
@@ -244,15 +244,17 @@ static int scale3d_ctl_step(scale3d_ctl *c, double iv_ms, uint64_t now) {   // �
     c->last_r10 = s3_rate(c, 5); c->last_r60 = c->nw >= 30 ? s3_rate(c, 30) : 0;
     int want_down = (c->nw >= 5 && c->last_r10 > 0.05) || (c->nw >= 30 && c->last_r60 > 0.015);
     if (want_down && c->level < c->max_level && s3_gpu_bound(c, 0)) {
-        if (c->last_up && now - c->last_up < 15 * S3_SEC) c->need_good = 45;
-        c->level++; scale3d_ctl_hold(c, now, 3 * S3_SEC); return c->level;
+        if (c->last_up && now - c->last_up < 30 * S3_SEC) c->need_good = 45;
+        c->level++; scale3d_ctl_hold(c, now, 5 * S3_SEC); return c->level;
     }
-    // 升档：连续干净窗满 15 个（30 秒）；或 GPU 明明有余量却还停在低档——低分辨率没换来任何东西，2 窗（4 秒）就往回升一档
-    // Raise: 15 consecutive clean windows (30 s); or the GPU clearly has headroom while the level is still low - the lower scale is buying nothing, so one level back up every 2 windows (4 s)
+    // 升档：必须当前窗无掉帧（clean）；GPU 持续有余量时满 2 个连续干净窗（4 秒）升一档，否则需满 15 个干净窗（30 秒）。
+    // 在掉帧活跃期绝不升档，防止因 CPU 慢帧导致的上下频繁切换与 G-buffer 重构。
+    // Raise: must have zero dropped frames in the current window (clean); with clear GPU headroom, raise after 2 consecutive clean windows (4 s), otherwise require 15 clean windows (30 s).
+    // Never upscale during active frame drops to prevent DRS thrashing and G-buffer reconstruction during CPU hitches.
     if (c->level > 0) {
         int need = c->need_good ? c->need_good : s3_gpu_bound(c, 1) ? 15 : 2;
-        if (clean || !s3_gpu_bound(c, 1)) {
-            if (++c->good_run >= need) { c->level--; c->last_up = now; c->need_good = 0; c->good_run = 0; scale3d_ctl_hold(c, now, 3 * S3_SEC); }
+        if (clean) {
+            if (++c->good_run >= need) { c->level--; c->last_up = now; c->need_good = 0; c->good_run = 0; scale3d_ctl_hold(c, now, 5 * S3_SEC); }
         }
         else c->good_run = 0;
     }

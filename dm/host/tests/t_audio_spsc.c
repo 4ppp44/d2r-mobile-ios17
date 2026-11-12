@@ -20,6 +20,13 @@ void hle_signal_system_event(void *g) {
     if (atomic_load_explicit(&g_last_pull, memory_order_seq_cst)) atomic_store(&g_after_last, 1);
 }
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }
+uint64_t hle_system_event_binding(void *g) { (void)g; return 1; }
+int hle_signal_system_event_binding(uint64_t binding) {
+    (void)binding;
+    atomic_fetch_add_explicit(&g_sig, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&g_last_pull, memory_order_seq_cst)) atomic_store(&g_after_last, 1);
+    return 1;
+}
 
 typedef struct {
     void *out;

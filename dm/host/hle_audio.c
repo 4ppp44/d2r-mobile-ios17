@@ -25,6 +25,7 @@ typedef struct { void *ptr; uint64_t cap, size; } gbuf;     // 写进客体 Audi
 typedef struct {
     pthread_mutex_t m;
     void *event;                       // 客体 SystemEvent：有缓冲被释放就触发 | Guest SystemEvent: signaled whenever a buffer is released
+    uint64_t event_binding;            // 绑定生命周期 ID（客体绑定后捕获） | Binding lifetime ID (captured after guest binding)
     int ch;
     _Atomic int state;
     gbuf *q[QMAX]; _Atomic uint32_t q_head, q_tail;       // 待播：游戏侧写，出声端读 | Pending: written by the game side, read by the output side
@@ -88,8 +89,10 @@ static void *event_notify(void *p) {
         { uint64_t t0 = atomic_load_explicit(&a->notify_ns, memory_order_relaxed), dt = t0 ? now_ns() - t0 : 0; int q = applied < 0 ? 0 : applied;
           atomic_fetch_add(&g_nq_wake[q], 1); atomic_fetch_add(&g_nq_lat_sum[q], dt); if (dt > 2000000) atomic_fetch_add(&g_nq_lat_2ms[q], 1);
           uint64_t mx = atomic_load(&g_nq_lat_max[q]); while (dt > mx && !atomic_compare_exchange_weak(&g_nq_lat_max[q], &mx, dt)) {} }
-        if (atomic_exchange_explicit(&a->notify_pending, 0, memory_order_acq_rel) && a->event)
-            hle_signal_system_event(a->event);
+        if (atomic_exchange_explicit(&a->notify_pending, 0, memory_order_acq_rel) && a->event_binding) {
+            if (!hle_signal_system_event_binding(a->event_binding))
+                a->event_binding = 0;
+        }
         atomic_store_explicit(&a->notify_armed, 0, memory_order_release);
         if (!atomic_load_explicit(&a->notify_run, memory_order_acquire)) break;
         if (atomic_load_explicit(&a->notify_pending, memory_order_acquire) &&
@@ -227,8 +230,11 @@ HLE_FORCE("_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventEPKcRKN
     atomic_init(&a->null_run, 0); atomic_init(&a->notify_run, 1);
     atomic_init(&a->notify_pending, 0); atomic_init(&a->notify_armed, 0);
     a->notify_sem = dispatch_semaphore_create(0);
+    if (ev) {
+        hle_bind_system_event(ev, 1);   // 缓冲释放事件：客体线程上绑内核事件（自动清除），之后由音频线程触发 | Buffer release event: bind a kernel event on the guest thread (auto-clear), afterwards signaled by the audio thread
+        a->event_binding = hle_system_event_binding(ev);
+    }
     pthread_create(&a->notify_th, NULL, event_notify, a);
-    if (ev) hle_bind_system_event(ev, 1);   // 缓冲释放事件：客体线程上绑内核事件（自动清除），之后由音频线程触发 | Buffer release event: bind a kernel event on the guest thread (auto-clear), afterwards signaled by the audio thread
     objmap_put(g, a);
     pthread_mutex_lock(&g_aos_lock);
     int slot = -1; for (int i = 0; i < AOMAX; i++) if (!g_aos[i]) { slot = i; break; }

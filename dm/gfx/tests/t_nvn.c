@@ -55,6 +55,7 @@ static size_t tex_size(int fmt, int w, int h, int flags, size_t *align) {
 }
 
 int main(void) {
+    setenv("DM_NVN_COUNT", "1", 1); // This suite explicitly asserts call counters.
     crash_install();   // 生产同一套 SIGSEGV / SIGBUS 处理（缺页钩子在其中分发） | the same SIGSEGV / SIGBUS handling as production (the page-fault hook is dispatched from within it)
     // 1. 引导取址：bootstrap 取 GetProcAddress，再用它取全部名字
     // 1. Bootstrap address lookup: bootstrap gets GetProcAddress, then uses it to get all the names

@@ -12,6 +12,7 @@ run: \
 	$(B)/t_altstack \
 	$(B)/t_audio \
 	$(B)/t_audio_spsc \
+	$(B)/t_system_event \
 	$(B)/t_cloudsync \
 	$(B)/t_condvar \
 	$(B)/t_condvar_old \
@@ -23,6 +24,7 @@ run: \
 	$(B)/t_hid_script \
 	$(B)/t_hud_dead \
 	$(B)/t_i18n \
+	$(B)/t_main_yield \
 	$(B)/t_minimap_lift \
 	$(B)/t_loader_weak \
 	$(B)/t_modetx \
@@ -79,6 +81,10 @@ run: \
 	$(B)/t_movie
 	$(B)/t_condvar
 	$(B)/t_condvar_old
+	$(B)/t_main_yield
+	$(B)/t_sync_wait
+	$(B)/t_crash_hang
+	$(B)/t_thread_exit_hoststack
 	$(B)/t_target_rank 2>/dev/null
 	$(B)/t_hud_dead
 	$(B)/t_namegen
@@ -143,6 +149,13 @@ $(B)/t_condvar: t_condvar.c t_condvar_stub.c ../hle_thread.c ../dm.h | $(B)
 	clang -O1 -Wno-unused-function -DDM_TEST_HOOKS -I.. -o $@ t_condvar.c t_condvar_stub.c ../hle_thread.c
 $(B)/t_condvar_old: t_condvar.c t_condvar_stub.c ../hle_thread.c ../dm.h | $(B)
 	clang -O1 -Wno-unused-function -DDM_TEST_HOOKS -DDM_TEST_CV_OLD_ORDER -I.. -o $@ t_condvar.c t_condvar_stub.c ../hle_thread.c
+$(B)/t_main_yield: t_main_yield.c t_condvar_stub.c ../hle_thread.c ../dm.h ../dm_yield_policy.h | $(B)
+	clang -O1 -Wno-unused-function -I.. -o $@ t_main_yield.c t_condvar_stub.c ../hle_thread.c
+$(B)/t_system_event: t_system_event.c ../hle_thread.c ../dm.h | $(B)
+	clang -O1 -g -Wall -Werror -Wno-unused-function -Wno-frame-address -I.. -o $@ t_system_event.c
+.PHONY: system-event
+system-event: $(B)/t_system_event
+	$(B)/t_system_event
 
 
 $(B)/t_fs_case: t_fs_case.c ../hle_fs.c ../hle.h ../dm.h ../dm_i18n.c | $(B)
@@ -187,3 +200,15 @@ $(B)/t_loader_weak: t_loader_weak.c ../loader.c ../hle.c ../dm.h ../hle.h | $(B)
 
 $(B)/t_minimap_lift: t_minimap_lift.c ../dm_cursor.c ../dm_cursor.h | $(B)
 	clang -O1 -Wall -Werror -Wno-unused-function -I.. -Wl,-dead_strip -o $@ t_minimap_lift.c
+
+$(B)/t_sync_wait: t_sync_wait.c t_condvar_stub.c ../hle_thread.c ../dm.h | $(B)
+	clang -O1 -Wno-unused-function -I.. -o $@ t_sync_wait.c t_condvar_stub.c
+run: $(B)/t_sync_wait
+
+$(B)/t_crash_hang: t_crash_hang.c ../crash.c ../dm.h | $(B)
+	clang -O1 -Wno-unused-function -I.. -o $@ t_crash_hang.c ../crash.c
+run: $(B)/t_crash_hang
+
+$(B)/t_thread_exit_hoststack: t_thread_exit_hoststack.c ../hle_thread.c ../entry.S ../dm.h | $(B)
+	clang -O1 -Wno-unused-function -I.. -o $@ t_thread_exit_hoststack.c ../entry.S
+run: $(B)/t_thread_exit_hoststack

@@ -154,9 +154,9 @@ int main(void) {
 
         // 5. 登记该贴图并在着色器描述符中读取验证
         mtl_reg_tex(50, &dst_t, NULL);
-        pthread_mutex_lock(&g_rmu);
+        os_unfair_lock_lock(&g_rmu);
         id<MTLTexture> bound_view = tex_by_id(50);
-        pthread_mutex_unlock(&g_rmu);
+        os_unfair_lock_unlock(&g_rmu);
         CHECK(bound_view != nil, "tex_by_id returned valid texture");
         CHECK(bound_view.pixelFormat == MTLPixelFormatASTC_4x4_LDR, "bound view kept ASTC_4x4_LDR format");
 
@@ -184,9 +184,9 @@ int main(void) {
         CHECK(serial_get(dst_t.serial) == expanded, "serial_put updated to expanded texture");
 
         // 8. 验证 tex_by_id 缓存失效并更新为 expanded 纹理
-        pthread_mutex_lock(&g_rmu);
+        os_unfair_lock_lock(&g_rmu);
         id<MTLTexture> new_view = tex_by_id(50);
-        pthread_mutex_unlock(&g_rmu);
+        os_unfair_lock_unlock(&g_rmu);
         CHECK(new_view != nil, "new_view exists");
         CHECK(new_view.pixelFormat == MTLPixelFormatRGBA8Unorm, "tex_by_id returned expanded RGBA8Unorm texture");
 

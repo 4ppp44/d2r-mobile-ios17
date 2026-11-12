@@ -13,6 +13,20 @@
 #include <mach/mach.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+
+// Fatal first-stage output never calls stdio, dladdr or an allocator.
+typedef struct { char b[512]; int n; } cw_t;
+static void cw_flush(cw_t *w) {
+    for (int o=0; o<w->n;) { ssize_t k=write(2,w->b+o,(size_t)(w->n-o));
+        if(k>0)o+=(int)k;else if(!(k<0&&errno==EINTR))break; }
+    w->n=0;
+}
+static void cw_s(cw_t*w,const char*s){for(;*s;s++){if(w->n==(int)sizeof w->b)cw_flush(w);w->b[w->n++]=*s;}}
+static void cw_hex(cw_t*w,uint64_t v){char t[19];int i=18;t[i]=0;do{t[--i]="0123456789abcdef"[v&15];v>>=4;}while(v);t[--i]='x';t[--i]='0';cw_s(w,t+i);}
+static void cw_dec(cw_t*w,long long v){char t[24];int i=23;t[i]=0;unsigned long long u=v<0?0ull-(unsigned long long)v:(unsigned long long)v;do{t[--i]=(char)('0'+u%10);u/=10;}while(u);if(v<0)t[--i]='-';cw_s(w,t+i);}
+static void cw_addr(cw_t*w,const char*tag,uint64_t a){cw_s(w," ");if(*tag){cw_s(w,tag);cw_s(w,"=");}module_t*m=module_of((void*)a);if(m){cw_s(w,m->name);cw_s(w,"+");cw_hex(w,a-(uint64_t)m->base);}else cw_hex(w,a);}
 
 static _Atomic uint64_t g_watch_last_ns;
 static _Atomic uint64_t g_watch_count;
@@ -129,6 +143,13 @@ void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // 按需导出现场（不退出）：iOS 包没有无进展看门狗，冒烟判红时经 DM_LOG_PORT 发 dump 触发——各客体线程在等什么 + 图形侧等待点，和看门狗打的是同一份
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
 void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
+static volatile sig_atomic_t g_crash_sig;
+static void crash_deadman(int sig) {
+    (void)sig;
+    static const char msg[]="[dm] CRASH：现场导出 3 秒没走完，直接退出 | crash dump did not finish in 3 s, exiting\n";
+    ssize_t k=write(2,msg,sizeof msg-1);(void)k;
+    _exit(128+g_crash_sig);
+}
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
@@ -136,11 +157,23 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         int is_write = (int)((uc->uc_mcontext->__es.__esr >> 6) & 1);   // ESR 的 WnR 位 | The WnR bit of ESR
         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) return;
     }
-    fprintf(stderr, "[dm] CRASH sig=%d", sig);
-    off("addr", (uint64_t)si->si_addr); off("pc", uc->uc_mcontext->__ss.__pc); off("lr", uc->uc_mcontext->__ss.__lr);
-    fprintf(stderr, " sp=%#llx\n", uc->uc_mcontext->__ss.__sp);
-    for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? "\n" : " ");
-    fprintf(stderr, "\n");
+    // Arm the fatal-path deadline before any output; unblock it even if SIGALRM
+    // was the original fatal signal. stderr may be a full pipe: never block there.
+    g_crash_sig=sig;
+    struct sigaction da={.sa_handler=crash_deadman};sigemptyset(&da.sa_mask);sigaction(SIGALRM,&da,0);
+    sigset_t unblocked;sigemptyset(&unblocked);sigaddset(&unblocked,SIGALRM);sigprocmask(SIG_UNBLOCK,&unblocked,NULL);alarm(3);
+    int flags=fcntl(2,F_GETFL);if(flags>=0)fcntl(2,F_SETFL,flags|O_NONBLOCK);
+    { cw_t w={.n=0};cw_s(&w,"[dm] CRASH sig=");cw_dec(&w,sig);
+      cw_addr(&w,"addr",(uint64_t)si->si_addr);cw_addr(&w,"pc",uc->uc_mcontext->__ss.__pc);cw_addr(&w,"lr",uc->uc_mcontext->__ss.__lr);
+      cw_s(&w," sp=");cw_hex(&w,uc->uc_mcontext->__ss.__sp);cw_s(&w,"\n");
+      for(int i=0;i<29;i++){cw_s(&w,"x");cw_dec(&w,i);cw_s(&w,"=");cw_hex(&w,uc->uc_mcontext->__ss.__x[i]);cw_s(&w,i%6==5?"\n":" ");}cw_s(&w,"\n");cw_flush(&w);
+      cw_s(&w,"[dm] bt (signal-safe):");uint64_t fp=uc->uc_mcontext->__ss.__fp;
+      for(int i=0;i<32&&fp&&!(fp&7);i++){uint64_t nfp=((uint64_t*)fp)[0],ra=((uint64_t*)fp)[1];cw_addr(&w,"",ra);if(nfp<=fp)break;fp=nfp;}
+      cw_s(&w,"\n");cw_flush(&w);
+    }
+    // Rich symbols/dump are best effort and bounded by the fatal-path alarm.
+    fprintf(stderr,"[dm] CRASH symbols:");
+    off("addr",(uint64_t)si->si_addr);off("pc",uc->uc_mcontext->__ss.__pc);off("lr",uc->uc_mcontext->__ss.__lr);fprintf(stderr,"\n");
     dm_backtrace(uc->uc_mcontext->__ss.__fp);
     if (g_dump_hook) g_dump_hook();
     _exit(128 + sig);

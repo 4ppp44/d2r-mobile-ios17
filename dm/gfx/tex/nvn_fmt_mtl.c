@@ -46,13 +46,13 @@ static const ent T[0x9D] = {
     [0x29] = E(RGBA16Float), E(RGBA16Unorm), E(RGBA16Snorm), E(RGBA16Uint), E(RGBA16Sint),
     [0x2E] = E(RGBA32Float), E(RGBA32Uint), E(RGBA32Sint),
     [0x31] = E(Stencil8), E(Depth16Unorm),
-    // DEPTH24：Apple GPU 无 Depth24（Depth24Unorm_Stencil8 iOS 不可用）→ Depth32Float：作渲染目标精度升级、行为等价；
-    // 标替代只因上传现成 24 位深度数据时需转浮点（渲染目标不涉及）
-    // DEPTH24: Apple GPUs have no Depth24 (Depth24Unorm_Stencil8 is unavailable on iOS) → Depth32Float: as a render target this is a precision upgrade with equivalent behavior;
-    // marked substitute only because uploading existing 24-bit depth data requires conversion to float (render targets are not affected)
+    // DEPTH24：Apple GPU 无 Depth24 → Depth32Float 替代，非逐位等价。
+    // 深度量化及 polygon offset 的 units 从定点语义变成浮点语义；上传也需转换。
+    // DEPTH24: Apple GPUs have no Depth24; Depth32Float is a substitute, not bitwise equivalent.
+    // Depth quantization and polygon-offset units change from fixed-point to float semantics; uploads also need conversion.
     [0x33] = S(Depth32Float), E(Depth32Float),
-    // DEPTH24_STENCIL8 → Depth32Float_Stencil8（同上：渲染目标精度升级、行为等价；上传数据需转换故标替代）；DEPTH32F_STENCIL8 精确
-    // DEPTH24_STENCIL8 → Depth32Float_Stencil8 (as above: precision upgrade as a render target, equivalent behavior; marked substitute because uploaded data needs conversion); DEPTH32F_STENCIL8 is exact
+    // DEPTH24_STENCIL8 同上，深度语义不精确等价；DEPTH32F_STENCIL8 格式精确对应。
+    // DEPTH24_STENCIL8 has the same depth-semantic caveat; DEPTH32F_STENCIL8 maps to the matching format.
     [0x35] = S(Depth32Float_Stencil8), E(Depth32Float_Stencil8),
     [0x37] = X(RGBA8Unorm_sRGB), E(RGBA8Unorm_sRGB),
     // 16 位打包格式：按名字对应——BGR 系（0x95–0x98）直接对 Metal 同名，RGB 系用同一 Metal 格式并交换 r/b。

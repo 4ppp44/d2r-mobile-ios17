@@ -6,7 +6,9 @@
 static inline void dm_present_schedule(id<MTLCommandBuffer> cb, id<MTLDrawable> drawable,
                                       void (^after)(double scheduled_s,double returned_s)) {
     [cb addScheduledHandler:^(id<MTLCommandBuffer> scheduled) {
-        (void)scheduled;
+        if (scheduled.status == MTLCommandBufferStatusError || scheduled.error != nil) {
+            return;
+        }
         const double begin=after?CACurrentMediaTime():0;
         [drawable present];
         if(after)after(begin,CACurrentMediaTime());

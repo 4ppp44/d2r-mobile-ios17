@@ -43,10 +43,10 @@ int main(int argc,char **argv){@autoreleasepool{enabled=1;for(int i=1;i<argc;i++
  uint8_t yellow[4]={255,255,0,0},green[4]={0,255,0,0}; // alpha由第二draw ONE/ ZERO给0；整数闭式RGB黄色。 | alpha is given 0 by the second draw's ONE/ ZERO; integer closed-form RGB yellow.
  for(int m=0;m<2;m++){unsigned bc=0,bd=0,bs=0;for(int i=0;i<64;i++){bc+=memcmp((uint8_t *)buffers[m][0].contents+4*i,small_depth && (i%8>=4||i/8>=4)?green:yellow,4)!=0;bd+=((float *)buffers[m][1].contents)[i]!=.75f;bs+=((uint8_t *)buffers[m][2].contents)[i]!=0x2d;}E("各64纹素手算黄色",0,bc);E("depth .75种子保持",0,bd);E("stencil 0x2d种子保持",0,bs);E("Reset后120索引40三角采样数",2560,q[m][0]);}
  E("三平面原候选逐字节",0,memcmp(buffers[0][0].contents,buffers[1][0].contents,256)||memcmp(buffers[0][1].contents,buffers[1][1].contents,256)||memcmp(buffers[0][2].contents,buffers[1][2].contents,64));
- E("原guard两pass",2,passes[0]);E("候选一pass/默认两pass",enabled&&!small_depth&&!sample_attachment?1:2,passes[1]);{ // DontCare（本通道没写不写回）：两个通道的深度状态都只开测试不开写，每个通道省一次深度模板写回 = 8×8×5 字节（Depth32F_S8 附件模型 5 B/像素） | DontCare (not stored if this pass did not write it): both passes' depth state enables only test, not write, so each pass saves one depth-stencil store = 8×8×5 bytes (Depth32F_S8 attachment model, 5 B/pixel)
-   const char *u=getenv("DM_NVN_UNWRITTEN_DC"); int udc=!(u&&!strcmp(u,"0")); unsigned dsb=udc&&!small_depth&&!sample_attachment?8*8*5:0;
-   E(udc?"原附件模型2048−2×320（DontCare）":"原附件模型2048",(small_depth?1152:2048)-2*dsb,bytes[0]);
-   E(udc?"候选附件模型1024−320（DontCare）":"候选附件模型1024/默认2048",(small_depth?1152:enabled&&!sample_attachment?1024:2048)-(enabled&&!sample_attachment?1:2)*dsb,bytes[1]); }
+ E("原guard两pass",2,passes[0]);E("候选一pass/默认两pass",enabled&&!small_depth&&!sample_attachment?1:2,passes[1]);{ // Read-only depth/stencil must survive the pass, including when UDC is requested.
+   E("reference attachment model preserves depth/stencil",small_depth?1152:2048,bytes[0]);
+   E("candidate attachment model preserves depth/stencil",small_depth?1152:enabled&&!sample_attachment?1024:2048,bytes[1]); }
+
  const char *dir=getenv("DM_GFX_FIXTURE_OUT");if(dir){char p[1024];for(int m=0;m<2;m++)for(int j=0;j<3;j++){snprintf(p,sizeof p,"%s/%s_%s.raw",dir,m?"candidate":"reference",j==0?"color":j==1?"depth":"stencil");FILE *f=fopen(p,"wb");if(!f||fwrite(buffers[m][j].contents,1,j==2?64:256,f)!=(j==2?64:256))abort();fclose(f);}}
  mtl_pool_del(ix);free(ix);printf("RT_RANGE_GPU cases=%d failed=%d\n",cases,bad);return bad!=0;
 }}

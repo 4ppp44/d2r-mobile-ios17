@@ -18,9 +18,9 @@ int main(void) { @autoreleasepool {
     other.d = old.d;
     mtl_sub_begin();
     mtl_reg_tex(10, &old, NULL); mtl_reg_tex(11, &old, NULL); mtl_reg_tex(12, &other, NULL);
-    pthread_mutex_lock(&g_rmu);
+    os_unfair_lock_lock(&g_rmu);
     tex_by_id(10); tex_by_id(11); tex_by_id(12);
-    pthread_mutex_unlock(&g_rmu);
+    os_unfair_lock_unlock(&g_rmu);
     CHECK(g_treg[10].view && g_treg[11].view, "both aliases populated");
     void *untouched = g_treg[12].view;
     uint64_t generation = g_reg_gen;

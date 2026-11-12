@@ -30,6 +30,7 @@ void dm_host_shutdown(const char *why);   // 宿主优雅退出（dm/host/hle_li
 #include "dm_measurement.h"
 #define DM_LOG_RING_IMPLEMENTATION
 #include "dm_log_ring.h"
+#include "../../gfx/nvn/nvn_pipeline_cache.h"   // 管线二进制归档落盘（进后台时刷） | Pipeline binary archive persistence (flushed on background)
 static NSString *T(const char *k) { return @(dm_ui(k)); }   // 我们自己的界面文字（中英表 dm/i18n/ui_text.tsv，语言跟原版设置走） | our own UI text (Chinese-English string table dm/i18n/ui_text.tsv, language follows the original game's setting)
 #import <Network/Network.h>
 #include "dm_metal_cache_guard.h"
@@ -1353,7 +1354,7 @@ static void bg_relaunch_test(void) {
 }
 
 @implementation App
-- (void)applicationWillTerminate:(UIApplication *)a { if (g_host_up) dm_host_shutdown("iOS App 终止"); }
+- (void)applicationWillTerminate:(UIApplication *)a { nvn_pcache_flush(); if (g_host_up) dm_host_shutdown("iOS App 终止"); }
 - (void)application:(UIApplication *)a handleEventsForBackgroundURLSession:(NSString *)ident completionHandler:(void (^)(void))done {
     plog("boot: 系统交来后台下载会话 %s 的事件（applicationState=%ld，宿主%s）", ident.UTF8String, (long)a.applicationState, g_host_up ? "在跑" : "没起");
     if ([ident hasSuffix:@".bgtest"]) { plog("后台测试会话：接回"); (void)bg_test_session(); done(); return; }
@@ -1373,6 +1374,9 @@ static void bg_relaunch_test(void) {
         NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0] stringByAppendingPathComponent:[fn.lastPathComponent stringByAppendingString:@".png"]];
         plog("DM_TEST_UISHOT：%s %s", path.fileSystemRepresentation, [UIImagePNGRepresentation(im) writeToFile:path atomically:YES] ? "已存" : "【红】没存下");
     }); }
+    // 进后台就落盘：系统随时可能在后台结束本进程；写失败不影响游戏（归档只是加速，坏了下次重建）
+    // Persist as soon as the app is backgrounded: the system may end the process while backgrounded, and a failed write never affects the game (the archive is only an accelerator and is rebuilt if bad)
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; nvn_pcache_flush_async(); }];
     plog("dm iOS 模式 %s · %s %s", g_mode.UTF8String, UIDevice.currentDevice.systemName.UTF8String, UIDevice.currentDevice.systemVersion.UTF8String);
     plog("启动计时 T1 静态构造 %.1f ms · T2 main %.1f ms · T3 didFinishLaunching %.1f ms（零点 = 进程创建）", g_T[1], g_T[2], g_T[3]);
     if ([g_mode isEqualToString:@"boot"]) { plog("boot: 启动完成，宿主等场景到前台再起（applicationState=%ld）", (long)a.applicationState); bg_relaunch_test(); return YES; }   // 资源没到的另等 AssetVC 下完 | if the assets have not arrived, this waits separately for AssetVC to finish downloading
@@ -1432,10 +1436,13 @@ int main(int argc, char *argv[]) {
         int profile = dm_power_profile(getenv("DM_POWER_PROFILE") ?: value.UTF8String);
         const char *name = profile==1?"native":profile==2?"conservative":profile==3?"native30":profile==4?"perf60":"balanced";
         setenv("DM_POWER_PROFILE",name,0);
-        if((!profile || profile==3) && !getenv("DM_FPS"))setenv("DM_FPS","30",0);
-        if(profile==4 && !getenv("DM_FPS"))setenv("DM_FPS","60",0);
+        if(!profile || profile==3)setenv("DM_PROFILE_FPS","30",1);
+        else setenv("DM_PROFILE_FPS","60",1);
         if(profile==2 && !getenv("DM_LEGACY_RESOURCE_ALL"))setenv("DM_LEGACY_RESOURCE_ALL","1",0);
         plog("boot: iOS17 性能档 %s（balanced=720p/30FPS；native=原生/60FPS；perf60=900p/60FPS；native30=原生/30FPS；conservative=原生/全资源声明）",name);
+        NSString *workerQoS = [[NSString stringWithContentsOfFile:[doc stringByAppendingPathComponent:@"worker_qos.txt"] encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if ([workerQoS isEqualToString:@"user_initiated"]) setenv("DM_GUEST_WORKER_QOS","user_initiated",0);
+        plog("boot: 工作线程 QoS 对照 %s（非锁核；主线程与翻译线程保持原策略）",getenv("DM_GUEST_WORKER_QOS") ?: "user_interactive");
         NSString *logSync = [[NSString stringWithContentsOfFile:[doc stringByAppendingPathComponent:@"log_sync_profile.txt"] encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         BOOL lineSync = [logSync isEqualToString:@"baseline"];
         setenv("DM_IOS17_LOG_BATCH",lineSync?"0":"1",0);

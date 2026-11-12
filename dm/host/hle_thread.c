@@ -27,8 +27,11 @@
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
+#include <setjmp.h>
+#include <stdatomic.h>
 
 #define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
+#define R_OUT_OF_RANGE 0xEE01u
 #define R_CANCELLED   0xEC01u   // 118
 #define R_BAD_HANDLE  0xE401u   // 114
 #define R_BAD_STATE   0xFA01u   // 125
@@ -37,6 +40,29 @@
 #define H_CUR_THREAD  0xFFFF8000u
 
 enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W };
+enum { MAX_SYNC_OBJECTS = 64 };
+typedef struct { void *obj; int type; } sync_ref_t;
+// 服务层 SystemEvent 绑定表（见 hle_bind_system_event）：客体 SystemEventType 地址 → 内核事件的写端句柄。
+// 条目随该句柄生命周期存活：CloseHandle 时将其注销（se_unbind），同一地址销毁重建时获得新内核事件。
+// 条目以往永久留存：第二次绑定早退，新事件未建且信号打到已关闭句柄（或重用该编号的事件）。
+// 锁顺序：先 G 后 g_se_lock（持有 g_se_lock 时绝不获取 G）
+// Service-layer SystemEvent bindings (see hle_bind_system_event): guest SystemEventType address → the write-end handle of its kernel event.
+// An entry lives as long as that handle: CloseHandle on it removes the entry (se_unbind), so a SystemEvent destroyed and created again at the same address gets a new kernel event.
+// Entries used to stay forever: the second bind returned early, the new event was never created and signals went to the closed handle (or to whatever event reused its number).
+// Lock order: G, then g_se_lock (nothing takes G while holding g_se_lock)
+static struct { void *ev; uint32_t wh; uint64_t id; } g_se[512];
+static int g_nse;
+static uint64_t g_next_se_id = 1;   // g_se_lock: 绑定身份在地址与句柄复用时不继承 | binding identity survives neither address nor handle reuse
+static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t se_find(void *ev) {   // 调用方持有 g_se_lock | caller holds g_se_lock
+    for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
+    return 0;
+}
+static void se_unbind(uint32_t wh) {   // 调用方持有 G | caller holds G
+    pthread_mutex_lock(&g_se_lock);
+    for (int i = 0; i < g_nse; ) if (g_se[i].wh == wh) g_se[i] = g_se[--g_nse]; else i++;
+    pthread_mutex_unlock(&g_se_lock);
+}
 typedef struct event { int signaled; int refs; } event_t;
 typedef struct thr {
     uint32_t handle; uint64_t id;
@@ -54,7 +80,8 @@ typedef struct thr {
     struct thr *next;          // 等待链 | Wait chain
     struct thr *all;           // 全部线程链（现场导出用） | All-threads chain (for the state dump)
     int last_svc; uint64_t last_lr;
-    int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
+    int closed, sync_refs;
+    sync_ref_t wobjs[MAX_SYNC_OBJECTS]; int wn, widx;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
     mach_port_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
     uint32_t qos;
@@ -64,7 +91,7 @@ static thr_t *g_all;
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
-static pthread_key_t g_keythr;
+static pthread_key_t g_keythr, g_keyhome;
 static uint64_t g_next_id = 0x51;
 static thr_t *g_wait;          // 全部在等的线程（锁 / 条件 / 地址 / 同步） | All waiting threads (lock / condition / address / synchronization)
 
@@ -224,18 +251,31 @@ extern void dm_thread_enter(uint64_t entry, uint64_t arg, uint64_t sp);   // ent
 uint32_t (*dm_thread_tick_fn)(void);   // 取当前游戏拍；diag.c 初始化时登记（单测不登记，拍号记 0） | Gets the current game tick; registered when diag.c initializes (unit tests do not register it, the tick number is recorded as 0)
 void crash_thread_init(void);
 void guest_thread_init(void);   // thread.c：每线程 TSD 槽（门、x18、TLS、TLR）唯一设置点 | thread.c: the single place that sets the per-thread TSD slots (gate, x18, TLS, TLR)
+// QoS is a scheduling hint, not P-core affinity. Keep the proven default;
+// permit an isolated worker-only comparison without changing critical threads.
+static qos_class_t guest_worker_qos(void) {
+    const char *p = getenv("DM_GUEST_WORKER_QOS");
+    return p && !strcmp(p, "user_initiated") ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE;
+}
+#include "dm_yield_policy.h"
+static void wake_sync_waiters(const void *obj);
 static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_setspecific(g_keythr, t);
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_set_qos_class_self_np(guest_worker_qos(), 0);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     t->mport = pthread_mach_thread_np(pthread_self());
     crash_thread_init();
     guest_thread_init();
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
-    dm_thread_enter(t->entry, t->arg, t->stack_top);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
-    die("客体线程入口返回");
+    sigjmp_buf home; pthread_setspecific(g_keyhome, &home);
+    if (sigsetjmp(home, 0) == 0) {
+        dm_thread_enter(t->entry, t->arg, t->stack_top);
+        die("客体线程入口返回");
+    }
+    pthread_exit(NULL);
+
 }
 static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 | Holding G; unlink from the all-threads chain and free
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
@@ -248,10 +288,12 @@ static void thread_exit(thr_t *t) {
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
     pthread_mutex_lock(&G);
     t->exited = 1;
-    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }   // 同步等待者重查 | Synchronization waiters re-check
+    wake_sync_waiters(t);
     pthread_setspecific(g_keythr, NULL);
-    if (t->closed) thr_free(t);
+    if (t->closed && !t->sync_refs) thr_free(t);
     pthread_mutex_unlock(&G);
+    sigjmp_buf *home = pthread_getspecific(g_keyhome);
+    if (home) { pthread_setspecific(g_keyhome, NULL); siglongjmp(*home, 1); }
     pthread_exit(NULL);
 }
 void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon 要求 ExitThread）"); }
@@ -260,11 +302,13 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
+    pthread_key_create(&g_keyhome, NULL);
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
     pthread_setspecific(g_keythr, t);
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     return t->handle;
@@ -272,14 +316,33 @@ uint32_t svc_thread_main_init(void) {
 
 // 单个客体主线程写；导出线程用 relaxed 原子读取独立累计值（不是事务快照）。
 // One guest-main writer; export uses relaxed atomics for independent totals, not a transactional snapshot.
-static uint64_t g_main_yield_n, g_main_yield_ns;
+static uint64_t g_main_yield_n, g_main_yield_ns, g_main_yield_bo;
 void dm_main_yield_stats_v2(uint64_t *n, uint64_t *ns, uint64_t *backoff_n) {
     *n = __atomic_load_n(&g_main_yield_n, __ATOMIC_RELAXED);
     *ns = __atomic_load_n(&g_main_yield_ns, __ATOMIC_RELAXED);
-    if (backoff_n) *backoff_n = 0;
+    if (backoff_n) *backoff_n = __atomic_load_n(&g_main_yield_bo, __ATOMIC_RELAXED);
 }
 void dm_main_yield_stats(uint64_t *n, uint64_t *ns) {
     dm_main_yield_stats_v2(n, ns, NULL);
+}
+// 慢让出：主线程一次 sched_yield 超过 2 ms（2601 实机长帧里常见「让出 2 次 / 20.0 ms」，即一次约一个调度时间片）。
+// 记次数、总耗时、窗口内最大值，以及当时时间约束（实时）策略是否已不在生效（超出声明计算量被系统撤 / 降级时为不生效）。只读计数，不改等待方式。
+// Slow yields: one sched_yield on the main thread taking over 2 ms (2601 device long frames often show "yield 2 times / 20.0 ms", i.e. about one scheduler quantum each).
+// Records count, total time, the window maximum, and whether the time-constraint (real-time) policy was no longer in effect at that moment (not in effect when the system revoked / demoted it for exceeding the declared computation). Read-only counters; the wait itself is unchanged.
+static uint64_t g_main_yield_slow_n, g_main_yield_slow_ns, g_main_yield_slow_max, g_main_yield_slow_rtoff;
+void dm_main_yield_slow_stats(uint64_t *n, uint64_t *ns, uint64_t *max, uint64_t *rt_off) {
+    *n = __atomic_load_n(&g_main_yield_slow_n, __ATOMIC_RELAXED);
+    *ns = __atomic_load_n(&g_main_yield_slow_ns, __ATOMIC_RELAXED);
+    *max = __atomic_exchange_n(&g_main_yield_slow_max, 0, __ATOMIC_RELAXED);
+    *rt_off = __atomic_load_n(&g_main_yield_slow_rtoff, __ATOMIC_RELAXED);
+}
+static void main_yield_slow(uint64_t d) {
+    __atomic_store_n(&g_main_yield_slow_n, __atomic_load_n(&g_main_yield_slow_n, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_main_yield_slow_ns, __atomic_load_n(&g_main_yield_slow_ns, __ATOMIC_RELAXED) + d, __ATOMIC_RELAXED);
+    if (d > __atomic_load_n(&g_main_yield_slow_max, __ATOMIC_RELAXED)) __atomic_store_n(&g_main_yield_slow_max, d, __ATOMIC_RELAXED);
+    thread_time_constraint_policy_data_t tp; mach_msg_type_number_t tc = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t def = 0;
+    if (thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tp, &tc, &def) != KERN_SUCCESS || def)
+        __atomic_store_n(&g_main_yield_slow_rtoff, __atomic_load_n(&g_main_yield_slow_rtoff, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
 }
 uint32_t dm_guest_work_qos(unsigned *count) {
     uint32_t qos = QOS_CLASS_UNSPECIFIED; unsigned n = 0;
@@ -296,20 +359,37 @@ uint32_t dm_guest_work_qos(unsigned *count) {
 
 // ---------- 同步对象 ----------
 // ---------- Synchronization objects ----------
-static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = signaled (holding G)
+static int sync_open(uint32_t h, sync_ref_t *ref) {   // holding G; no pseudo-handles
     unsigned i = h - 0x1000;
-    if (h == H_CUR_THREAD) return 0;
-    if (i == 0 || i >= MAX_H) { *bad = 1; return 0; }
-    switch (g_h[i].type) {
-    case O_THREAD: return ((thr_t *)g_h[i].obj)->exited;
-    case O_EVENT_R: return ((event_t *)g_h[i].obj)->signaled;
-    default: *bad = 1; return 0;
+    if (i == 0 || i >= MAX_H) return 0;
+    if (g_h[i].type == O_THREAD) ((thr_t *)g_h[i].obj)->sync_refs++;
+    else if (g_h[i].type == O_EVENT_R) ((event_t *)g_h[i].obj)->refs++;
+    else return 0;
+    *ref = (sync_ref_t){g_h[i].obj, g_h[i].type};
+    return 1;
+}
+static void sync_close(sync_ref_t ref) {   // holding G
+    if (ref.type == O_THREAD) {
+        thr_t *t = ref.obj;
+        if (!--t->sync_refs && t->closed && t->exited) thr_free(t);
+    } else {
+        event_t *e = ref.obj;
+        if (!--e->refs) free(e);
     }
 }
-static void wake_sync_waiters(void) {
-    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }
+static int sync_signaled(sync_ref_t ref) {   // holding G
+    return ref.type == O_THREAD ? ((thr_t *)ref.obj)->exited : ((event_t *)ref.obj)->signaled;
 }
-
+// Complete each registered wait under G: a clear before the waiter resumes
+// must not erase the notification that already made it runnable.
+static void wake_sync_waiters(const void *obj) {
+    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next;
+        if (w->wkind == 4)
+            for (int i = 0; i < w->wn; i++) if (w->wobjs[i].obj == obj) {
+                w->widx = i; wake(w, 0); break;
+            }
+        w = n; }
+}
 static int64_t now_mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000000000ll + ts.tv_nsec; }
 void dm_guest_clock_advanced(void) {
     if (!dm_detclock_enabled()) return;
@@ -538,10 +618,30 @@ int svc_thread(int num, uint64_t *regs) {
             thr_t *me = pthread_getspecific(g_keythr);
             if (me && me->handle == 0x1001) {
                 uint64_t y0 = now_ns();
-                sched_yield();
+                static uint32_t s_consec;
+                static uint64_t s_last_y;
+                if (y0 - s_last_y > 500000ull) s_consec = 0;   // 离上次让出超 0.5 ms：新一轮等待 | >0.5 ms since last yield: new wait round
+                if (s_consec < UINT32_MAX) s_consec++;
+                s_last_y = y0;
+                uint32_t sleep_ns = dm_yield_sleep_ns(s_consec);
+                if (!sleep_ns) {
+                    for (int k = 0; k < 64; k++) {
+#if defined(__aarch64__) || defined(__arm64__)
+                        __asm__ volatile("yield" ::: "memory");
+#elif defined(__x86_64__)
+                        __asm__ volatile("pause" ::: "memory");
+#endif
+                    }
+                } else {
+                    struct timespec ts = {0, sleep_ns};
+                    nanosleep(&ts, NULL);
+                    __atomic_store_n(&g_main_yield_bo, __atomic_load_n(&g_main_yield_bo, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+                }
                 uint64_t y1 = now_ns();
+                s_last_y = y1;
                 __atomic_store_n(&g_main_yield_ns, __atomic_load_n(&g_main_yield_ns, __ATOMIC_RELAXED) + y1 - y0, __ATOMIC_RELAXED);
                 __atomic_store_n(&g_main_yield_n, __atomic_load_n(&g_main_yield_n, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+                if (y1 - y0 > 2000000) main_yield_slow(y1 - y0);
             } else {
                 sched_yield();
             }
@@ -653,36 +753,43 @@ int svc_thread(int num, uint64_t *regs) {
         event_t *e = num == 0x11 ? h_peek(h, O_EVENT_W) : num == 0x17 ? h_peek(h, O_EVENT_R)
                    : (h_peek(h, O_EVENT_W) ? h_peek(h, O_EVENT_W) : h_peek(h, O_EVENT_R));
         int64_t r = 0;
-        if (!e) { r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
+        if (!e) { r = R_BAD_HANDLE;
                   if (r == R_BAD_HANDLE) LOG("事件 SVC %#x 句柄无效 %#x", num, h); }
-        else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(); }
+        else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(e); }
         else if (num == 0x17 && !e->signaled) r = R_BAD_STATE;
         else e->signaled = 0;
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x18: {  // WaitSynchronization(→w1 下标; x1 句柄数组, w2 个数, x3 超时) | WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)
-        thr_t *t = cur(); const uint32_t *hs = (const uint32_t *)regs[1]; int n = (int)regs[2]; int64_t ns = (int64_t)regs[3];
-        int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
+    case 0x18: {  // WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)
+        thr_t *t = cur(); int n = (int)regs[2]; int64_t ns = (int64_t)regs[3];
+        if (n < 0 || n > MAX_SYNC_OBJECTS) { regs[0] = R_OUT_OF_RANGE; regs[1] = 0; return 1; }
+        int64_t wait_ns = ns;
+        uint32_t hs[MAX_SYNC_OBJECTS]; sync_ref_t *objects = t->wobjs;
+        if (n) memcpy(hs, (const void *)regs[1], n * sizeof *hs);
         pthread_mutex_lock(&G);
-        int64_t r; int idx = -1;
-        for (;;) {
-            if (t->cancel) { t->cancel = 0; r = R_CANCELLED; break; }
-            int bad = 0;
-            for (int i = 0; i < n && idx < 0; i++) if (sig_obj(hs[i], &bad)) idx = i;
-            if (bad) { r = R_BAD_HANDLE; break; }
-            if (idx >= 0) { r = 0; break; }
-            int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns());
-            if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
-            if (block(t, 4, left) == R_TIMEOUT) { r = R_TIMEOUT; break; }
+        int held = 0, idx = -1; int64_t r = R_BAD_HANDLE;
+        while (held < n && sync_open(hs[held], &objects[held])) held++;
+        if (held == n) {
+            for (int i = 0; i < n; i++) if (sync_signaled(objects[i])) { idx = i; break; }
+            // Ready objects, then a zero-time poll, precede pending cancellation.
+            if (idx >= 0) r = 0;
+            else if (!ns) r = R_TIMEOUT;
+            else if (t->cancel) { t->cancel = 0; r = R_CANCELLED; }
+            else {
+                t->wn = n; t->widx = -1;
+                r = block(t, 4, wait_ns); idx = t->widx;
+                t->wn = 0;
+            }
         }
+        for (int i = 0; i < held; i++) sync_close(objects[i]);
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
     }
-    case 0x19: {  // CancelSynchronization(w0 线程) | CancelSynchronization(w0 thread)
+    case 0x19: {  // CancelSynchronization(w0 thread)
         pthread_mutex_lock(&G);
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-        if (t) { t->cancel = 1; if (t->wkind == 4) wake(t, -1); }
+        if (t) { if (t->wkind == 4) wake(t, R_CANCELLED); else t->cancel = 1; }
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
@@ -690,13 +797,14 @@ int svc_thread(int num, uint64_t *regs) {
         pthread_mutex_lock(&G);
         unsigned i = (uint32_t)regs[0] - 0x1000;
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
+            if (g_h[i].type == O_EVENT_W) se_unbind((uint32_t)regs[0]);
             event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
         } else if (i > 0 && i < MAX_H && g_h[i].type == O_THREAD) {
             thr_t *t = g_h[i].obj;
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
             t->closed = 1;
-            if (t->exited) thr_free(t);
+            if (t->exited && !t->sync_refs) thr_free(t);
         }
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
@@ -711,13 +819,6 @@ int svc_thread(int num, uint64_t *regs) {
 // ---------- SystemEvent of the service layer ----------
 // Real device: the service hands the read end of a kernel event to the client, and the guest waits on it through SDK nn::os. Host: on a guest thread, call the SDK's own
 // CreateSystemEvent(inter-process=true), and the SDK creates the kernel event through SVC 0x45; the write-end handle is recorded, after which any thread (including the host audio thread) can signal it.
-static struct { void *ev; uint32_t wh; } g_se[512];
-static int g_nse;
-static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t se_find(void *ev) {
-    for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
-    return 0;
-}
 void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线程上调（要执行 SDK 代码） | Must be called on a guest thread (it has to execute SDK code)
     pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
     if (wh) return;
@@ -730,15 +831,49 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
     wh = getw(ev);
     pthread_mutex_lock(&g_se_lock);
     if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent 绑定表满");
-    g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
+    g_se[g_nse].ev = ev; g_se[g_nse].wh = wh; g_se[g_nse++].id = g_next_se_id++;
     pthread_mutex_unlock(&g_se_lock);
 }
-void hle_signal_system_event(void *ev) {   // 未绑定的按手动清除即时绑定（只能在客体线程上发生） | An unbound one is bound on the spot as manual-clear (can only happen on a guest thread)
-    pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
-    if (!wh) { hle_bind_system_event(ev, 0); pthread_mutex_lock(&g_se_lock); wh = se_find(ev); pthread_mutex_unlock(&g_se_lock); }
+uint64_t hle_system_event_binding(void *ev) {
+    uint64_t id = 0;
+    pthread_mutex_lock(&g_se_lock);
+    for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) { id = g_se[i].id; break; }
+    pthread_mutex_unlock(&g_se_lock);
+    return id;
+}
+int hle_signal_system_event_binding(uint64_t binding) {
+    // 匹配生命周期并在 G 下发信号，正如 CloseHandle 在 G 下注销：过期的生产者绝不能向重用编号的新事件发信号
+    // Match the lifetime and signal under G, just as CloseHandle removes it under
+    // G: a stale producer cannot signal a new event that reuses either number.
     pthread_mutex_lock(&G);
-    event_t *e = h_get(wh, O_EVENT_W);
-    if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
-    e->signaled = 1; wake_sync_waiters();
+    uint32_t wh = 0;
+    pthread_mutex_lock(&g_se_lock);
+    for (int i = 0; i < g_nse; i++) if (g_se[i].id == binding) { wh = g_se[i].wh; break; }
+    pthread_mutex_unlock(&g_se_lock);
+    event_t *e = wh ? h_get(wh, O_EVENT_W) : NULL;
+    if (e) { e->signaled = 1; wake_sync_waiters(e); }
     pthread_mutex_unlock(&G);
+    return e != NULL;
+}
+void hle_signal_system_event(void *ev) {   // 未绑定的按手动清除即时绑定（只能在客体线程上发生；非客体线程则跳过） | An unbound one is bound on the spot as manual-clear (only on a guest thread: off one it is skipped)
+    // 在 G 的单次持有下查找与触发：CloseHandle（负责注销）也在 G 下运行，句柄不会在中间被关闭并重用编号
+    // Lookup and signal under one hold of G: CloseHandle (which unbinds) also runs under G, so the handle cannot be closed and its number reused in between
+    for (int bound = 0; ; bound = 1) {
+        pthread_mutex_lock(&G);
+        pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
+        if (wh) {
+            event_t *e = h_get(wh, O_EVENT_W);
+            if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
+            e->signaled = 1; wake_sync_waiters(e);
+            pthread_mutex_unlock(&G);
+            return;
+        }
+        pthread_mutex_unlock(&G);
+        if (bound) die("SystemEvent %p 在绑定后仍未找到", ev);
+        // 宿主线程（音频、定时器等）向游戏已销毁的事件发信号：绑定需要执行客体 SDK 代码，只能在客体线程上运行，且事件本已销毁
+        // A host thread (audio, vsync) signalling an event the game has destroyed: binding needs SDK code, which only a guest thread can run, and the event is gone anyway
+        // (MacNativeGames dab728a: skipped, not fatal)
+        if (!pthread_getspecific(g_keythr)) { static _Atomic int once; if (!atomic_exchange(&once, 1)) LOG("【红】SystemEvent %p 在游戏销毁后由非客体线程触发：跳过", ev); return; }
+        hle_bind_system_event(ev, 0);   // 客体代码（SVC 会获取 G）：在锁外执行 | guest code (SVCs take G): outside the lock
+    }
 }

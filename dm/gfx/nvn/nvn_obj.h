@@ -149,6 +149,12 @@ void xv_test_counts(int *dc, int *viol);
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1);   // 该帧最早 GPUStart / 最晚 GPUEnd（mach 绝对时间 ns）；未全部完成或无 GPU 时间返回 0 | The frame's earliest GPUStart / latest GPUEnd (mach absolute time, ns); returns 0 if not all complete or there is no GPU time
 void mtl_stats(uint64_t *passes, uint64_t *draws);
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
+void mtl_dup_draw_stats(uint64_t *dups);   // 同绘制去重命中次数（缺省关；真机 A/B 用 Documents/dm_dup_draw） | Duplicate-draw hits (off by default; a device A/B uses Documents/dm_dup_draw)
+int mtl_dup_draw_on(void);                 // 同绘制去重当前是否打开 | whether duplicate-draw removal is currently on
+int mtl_opt_off(void);                     // build2802 热路径总开关：1 = 全关（Documents/dm_opt=0） | master switch for the build2802 hot paths: 1 = all off
+uint64_t mtl_intfix_count(void);            // 靠「整数顶点格式重试」才建成的管线数（真机确认缺陷命中面） | pipelines that only built after the integer-vertex-format retry
+void mtl_drv_fill_stats(uint64_t *fills);  // 驱动常量段块真正重建的次数 | How often a driver constant segment block was really rebuilt
+void mtl_addr_memo_stats(uint64_t *hits);  // 客体地址解析命中缓存的次数 | Guest-address memo hits
 void mtl_use_stats(uint64_t *call, uint64_t *skip);
 uint64_t mtl_ds_omit(void);   // 前瞻证明不用深度模板、未挂深度附件的通道累计数 | Cumulative number of passes with no depth attachment because the lookahead proved depth-stencil unused
 uint64_t mtl_drawable_ns_take(void);   // 取走并清零：出图里等 nextDrawable 的累计 ns   // useResource 实发 / 同编码器去重跳过累计次数   // 参数缓冲新编 / 复用累计次数 | Take and zero: cumulative ns spent waiting for nextDrawable in present   // Cumulative useResource calls actually issued / skipped by same-encoder dedup   // Cumulative argument buffer new-encode / reuse counts

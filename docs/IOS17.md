@@ -1,5 +1,9 @@
 # iOS17 build notes / 构建与限制
 
+## Current source baseline:1202 (2026-11-13 public sync)
+
+See[the1202 runtime review](PERFORMANCE_1202.md): a609ms cold-pipeline spike remains. Earlier “1705/2501” sections below are historical, not the current runtime acceptance result. The build helper and generated-input requirements remain applicable. No public playable IPA or new release attachment is supplied.
+
 ## Prerequisites
 Use an Apple-silicon Mac with Xcode, command-line tools, xcodegen and upstream Python/tool dependencies. The unsigned direct-install helper defaults to native opaque PNG icons (`DM_IOS17_ICON_MODE=png`), generated from the tracked upstream icon and declared using Apple's `CFBundleIcons` / `CFBundleIconFiles`. All game sources and resources are still compiled and linked; this is not an icon-less or partial game build. It is not an App Store/TestFlight icon submission path.
 

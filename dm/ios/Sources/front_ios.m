@@ -132,7 +132,7 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
     UIView *_rsCover;   // 一键重开期间的黑屏（宿主 dm_cursor.c 经 g_dm_restart_cover_hook 开关）：盖在窗口最上层（整屏，含真全屏的留边），不露主菜单，吞掉这段时间的触点 | Black screen during one-tap restart (toggled by the host's dm_cursor.c via g_dm_restart_cover_hook): covers the top of the window (whole screen, including the true-fullscreen margins), does not reveal the main menu, and swallows touch points during this period
     int _navigation;
     CALayer *_mgLabel[12], *_mgMark[12];   // 小地图任务终点：每个终点一个名牌 / 符号层 + 一个灰十字层（mapGoalSync） | Minimap quest goals: one nameplate / symbol layer + one grey cross layer per goal (mapGoalSync)
-    NSMutableDictionary<NSString *,UIImage *> *_mgImg;
+    NSMutableDictionary<NSString *,id> *_mgImg; // NSNull caches missing immutable bundled images.
     uint64_t _modifierPublishEndNS,_modifierPublishEpoch;
     uint64_t _touchEventSeq,_touchReceiptSeq,_touchPublishedEventSeq; // 仅 DM_TOUCH_CONTROL_LOG 开启时推进 | Advanced only when DM_TOUCH_CONTROL_LOG is on
     UITouch *_pendEnd; double _pendEndTime,_pendWall; BOOL _pendFire,_finalAsked;   // 松手了但宿主的答案还没回：这根手指的「抬起」先挂着（见 finishTouches） | Released but the host's answer is not back yet: this finger's "lift" is held pending (see finishTouches)
@@ -260,7 +260,7 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
         _overlay.nativeMapping.secondary_group,_overlay.nativeMapping.group_seen,_overlay.nativeMapping.identity_scope);
         _touchPublishedEventSeq=_touchEventSeq;
     }
-    [_overlay setNeedsDisplay];
+    [_overlay controlsChanged];
 }
 - (void)cancelControlsFrom:(const char *)source {
     _pendEnd=nil; _finalAsked=NO;
@@ -319,7 +319,7 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
         dm_tc_resize(&_controls,self.bounds.size.width,self.bounds.size.height);[_overlay setNeedsDisplay];
     }
     hud_stack_watch();
-    { dm_hud_info h, o=_overlay.hud; dm_hud_get(&h); h.x=h.y=0; if (memcmp(&h,&o,sizeof h)) { _overlay.hud=h; [_overlay setNeedsDisplay]; } }   // 覆盖层不画玩家坐标：不清掉的话走路时每个逻辑拍都判「变了」、整层全屏重画一遍 | The overlay does not draw player coordinates: without clearing them, every logic tick while walking would be judged "changed" and redraw the whole layer fullscreen
+    { dm_hud_info h, o=_overlay.hud; dm_hud_get(&h); h.x=h.y=0; if (memcmp(&h,&o,sizeof h)) _overlay.hud=h; }   // 覆盖层不画玩家坐标：不清掉的话走路时每个逻辑拍都判「变了」、整层全屏重画一遍 | The overlay does not draw player coordinates: without clearing them, every logic tick while walking would be judged "changed" and redraw the whole layer fullscreen
     dm_tg_snapshot snapshot={0};
     dm_touch_game_snapshot(&snapshot);
     _overlay.nativeMapping=snapshot;
@@ -389,15 +389,19 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
 // Conversion: world cell (x, y) on the map is at player point + ((Δx−Δy)×1.6, (Δx+Δy)×0.8) × pixels per cell; the player point on the fullscreen map = the on-screen position of the player's feet, on the minimap = the center of the minimap frame.
 // Not drawn while a panel is open (navigation mode) -- the top-right minimap is collapsed then too. Layers have no implicit animation; positions update every frame as the player walks.
 - (UIImage *)mgImage:(NSString *)name {
-    UIImage *im=_mgImg[name]; if(im) return im; if(!_mgImg) _mgImg=[NSMutableDictionary dictionary];
-    im=[UIImage imageWithContentsOfFile:[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:[@"mapgoal/" stringByAppendingString:name]]];
-    if(im) _mgImg[name]=im; return im;
+    id hit=_mgImg[name]; if(hit) return hit==NSNull.null ? nil : hit; if(!_mgImg) _mgImg=[NSMutableDictionary dictionary];
+    UIImage *im=[UIImage imageWithContentsOfFile:[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:[@"mapgoal/" stringByAppendingString:name]]];
+    _mgImg[name]=im ?: NSNull.null; return im;
 }
 - (void)mapGoalSync {
     static int old=-1; if(old<0) { int dm_custom_get(const char *key); old=dm_custom_get("item_notes")!=0; }   // 旧译名开关重启生效，启动读一次（名牌字跟游戏显示的一致） | The old translation names switch takes effect on restart; read once at launch (nameplate text matches what the game shows)
-    dm_map_goal_view v; float cell=0; int mode=dm_ui_map_geom(&cell), n=dm_map_goals(&v); int rw=0,rh=0; dm_screen_real(&rw,&rh);
+    dm_map_goal_view v={0}; float cell=0; int mode=dm_ui_map_geom(&cell), n=dm_map_goals(&v); int rw=0,rh=0; dm_screen_real(&rw,&rh);
     CGRect wr=world_rect(self); float mm[4]; BOOL haveMini=dm_ui_minimap_rect(mm);
     BOOL show=mode && n>0 && !_navigation && !_info.hidden && rw>0 && cell>0 && (mode==2 || haveMini);
+    // Logical inputs change at game ticks, not at every display callback.
+    { static struct { dm_map_goal_view v; float cell, mm[4]; int mode, rw, rh, show, lg; CGRect wr; CGSize z; } last, cur; memset(&cur,0,sizeof cur);
+      cur.v=v; cur.cell=cell; if(haveMini) memcpy(cur.mm,mm,sizeof mm); cur.mode=mode; cur.rw=rw; cur.rh=rh; cur.show=show; cur.lg=dm_lang_index(); cur.wr=wr; cur.z=self.bounds.size;
+      if(_mgLabel[0] && !memcmp(&cur,&last,sizeof cur)) return; last=cur; }
     [CATransaction begin]; [CATransaction setDisableActions:YES];
     CGSize z=self.bounds.size; CGFloat k=wr.size.width/rw, c=cell*k, H=wr.size.height, lh=H*0.0236, sh=H*0.085*(mode==1?0.6:1);   // 名牌高（原版名牌字高约屏高 1/53）、符号高（的大小） | Nameplate height (the original game's nameplate glyph height is about 1/53 of screen height), symbol height (its size)
     CGPoint o; CGRect area;
@@ -1541,7 +1545,34 @@ void front_ios_lifecycle_install(void) {
 // Each line: seconds, thermal state (0 nominal / 1 fair / 2 serious / 3 critical), process CPU% (delta of user + system time of all threads ÷ wall clock, 100 = one core),
 //       actual output frame rate, per-frame GPU ms mean / p95 / sample count (command buffer gpuEnd − gpuStart, read from the graphics backend), screen brightness (0–1), screen maximum refresh rate
 #include <sys/resource.h>
+#include <mach/mach_time.h>
 void nvn_gpu_recent(double *avg, double *p95, unsigned *n);
+int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc（iOS SDK 无头文件，符号在 libsystem） | libproc (no header in the iOS SDK; the symbol is in libsystem)
+// 功耗与核档位（每 10 秒一行「[诊断] 功耗」）：proc_pid_rusage(RUSAGE_INFO_V6) 的进程 CPU 能耗（nJ，内核按核档位能耗模型计）、
+// P 核时间 / 周期与全部时间 / 周期之差（= 能效核），由此得 P 核时间占比与两档各自的平均主频；task_info(TASK_POWER_INFO_V2) 的 GPU 占用时间。
+// 只读计数器，不改调度、不改画质。屏幕、基带等进程外功耗不在内。
+// Power and core level (one "[诊断] 功耗" line every 10 seconds): process CPU energy from proc_pid_rusage(RUSAGE_INFO_V6) (nJ, from the kernel's per-level energy model),
+// P-core time / cycles and the difference from total time / cycles (= efficiency cores), giving the P-core time share and the average clock of each level; GPU busy time from task_info(TASK_POWER_INFO_V2).
+// Read-only counters; no scheduling or quality change. Screen, modem and other power outside the process are not included.
+typedef struct { int ok; uint64_t t_ns, pt_ns, cyc, pcyc, nj, pnj, wk, gpu; } pwr_snap;
+static void pwr_read(pwr_snap *s) {
+    static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+    struct rusage_info_v6 ri; memset(s, 0, sizeof *s);
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&ri) == 0) {
+        s->ok = 1;   // ri_*_time 是 mach 绝对时间单位 | ri_*_time is in mach absolute time units
+        s->t_ns = (ri.ri_user_time + ri.ri_system_time) * tb.numer / tb.denom; s->pt_ns = (ri.ri_user_ptime + ri.ri_system_ptime) * tb.numer / tb.denom;
+        s->cyc = ri.ri_cycles; s->pcyc = ri.ri_pcycles; s->nj = ri.ri_energy_nj; s->pnj = ri.ri_penergy_nj; s->wk = ri.ri_pkg_idle_wkups + ri.ri_interrupt_wkups;
+    }
+    struct task_power_info_v2 pi; mach_msg_type_number_t n = TASK_POWER_INFO_V2_COUNT;
+    if (task_info(mach_task_self(), TASK_POWER_INFO_V2, (task_info_t)&pi, &n) == KERN_SUCCESS) s->gpu = pi.gpu_energy.task_gpu_utilisation;
+}
+static void pwr_log(const pwr_snap *a, const pwr_snap *b, double dt, double sec) {
+    if (!a->ok || !b->ok) { static int once; if (!once++) LOG("[诊断] 功耗：RUSAGE_INFO_V6 读不到，本系统不出功耗行"); return; }
+    double t = (double)(b->t_ns - a->t_ns), pt = (double)(b->pt_ns - a->pt_ns), et = t - pt, pc = (double)(b->pcyc - a->pcyc), ec = (double)(b->cyc - a->cyc) - pc;
+    LOG("[诊断] 功耗 第 %.0f 秒：CPU %.2f W（P核 %.2f W）；P核时间占比 %.0f%%；P核主频 %.2f GHz、能效核主频 %.2f GHz；唤醒 %.0f 次/秒；GPU占用 %.0f ms/秒",
+        sec, (b->nj - a->nj) / 1e9 / dt, (b->pnj - a->pnj) / 1e9 / dt, t > 0 ? pt / t * 100 : -1,
+        pt > 0 ? pc / pt : 0, et > 0 ? ec / et : 0, (b->wk - a->wk) / dt, (b->gpu - a->gpu) / 1e6 / dt);
+}
 // 没设 DM_HEAT（玩家正常启动）：每 10 秒往日志里记一行同样的读数，另带电量 / 充电 / 低电量模式——玩家报「卡 / 烫 / 掉电」时日志里有当时的背景。
 // 一次取样是几次系统调用加一次最多 1024 个数的排序，耗时记在行尾（取样 … ms）；切过后台的那一拍间隔不准，不记。
 // DM_HEAT not set (normal player launch): log one line with the same readings every 10 seconds, plus battery level / charging / low power mode -- when a player reports "lag / hot / battery drain", the log has the background at that time.
@@ -1553,8 +1584,9 @@ void front_ios_heat_start(uint64_t (*presents)(void), int has_gpu) {
         UIDevice.currentDevice.batteryMonitoringEnabled = YES;
         __block uint64_t t0 = now_ns(), tl = t0, pl = presents(); __block double cl = 0;
         { struct rusage ru; getrusage(RUSAGE_SELF, &ru); cl = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6; }
+        __block pwr_snap pw; pwr_read(&pw);
         [NSTimer scheduledTimerWithTimeInterval:10 repeats:YES block:^(NSTimer *tm) { (void)tm;
-            uint64_t t = now_ns(), p = presents(); struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+            uint64_t t = now_ns(), p = presents(); struct rusage ru; getrusage(RUSAGE_SELF, &ru); pwr_snap pn; pwr_read(&pn);
             double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6, dt = (t - tl) / 1e9;
             double ga = -1, gp = -1; unsigned gn = 0; if (has_gpu) nvn_gpu_recent(&ga, &gp, &gn);
             if (dt < 15) {
@@ -1565,8 +1597,9 @@ void front_ios_heat_start(uint64_t (*presents)(void), int has_gpu) {
                     (long)NSProcessInfo.processInfo.thermalState, UIScreen.mainScreen.brightness, bat,
                     bs == UIDeviceBatteryStateCharging ? "充电中" : bs == UIDeviceBatteryStateFull ? "已充满" : bs == UIDeviceBatteryStateUnplugged ? "未充电" : "充电状态未知",
                     NSProcessInfo.processInfo.lowPowerModeEnabled ? "开" : "关", (now_ns() - t) / 1e6);
+                pwr_log(&pw, &pn, dt, (t - t0) / 1e9);
             }
-            tl = t; pl = p; cl = cpu; }];
+            tl = t; pl = p; cl = cpu; pw = pn; }];
         return;
     }
     char rel[512]; snprintf(rel, sizeof rel, "%.*s", (int)strcspn(e, ","), e); const char *c = strchr(e, ','); int iv = c ? atoi(c + 1) : 10;

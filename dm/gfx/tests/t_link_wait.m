@@ -21,7 +21,7 @@ static int deadline_wait(pthread_cond_t *cv, pthread_mutex_t *mu, const struct t
 static int failed;
 #define CHECK(label, cond) do { int ok = !!(cond); failed += !ok; printf("%s %s\n", label, ok ? "PASS" : "FAIL"); } while (0)
 int main(void) { @autoreleasepool {
-    g_link = (CAMetalDisplayLink *)[NSObject new]; g_dm_present_link = 1; g_link_mode = 3;
+    g_link = (CAMetalDisplayLink *)[NSObject new]; g_dm_present_link = 2; g_link_mode = 2;
     g_link_tick_n = 100; wake_tick = 102; wait_result = ETIMEDOUT;
     CHECK("callback_at_timeout_is_success", mtl_link_wait_tick(66666666) == 1);
     g_link_tick_n = 104; int before = wait_calls;
